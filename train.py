@@ -103,13 +103,11 @@ idct_m = torch.tensor(idct_m).float().cuda().unsqueeze(0)
 
 
 def update_lr_multistep(nb_iter, total_iter, max_lr, min_lr, optimizer):
-    if nb_iter > 30000:
-        current_lr = 1e-5
-    else:
-        current_lr = 3e-4
+    progress = min(1.0, max(0.0, float(nb_iter) / float(max(1, total_iter - 1))))
+    current_lr = min_lr + 0.5 * (max_lr - min_lr) * (1.0 + np.cos(np.pi * progress))
 
     for param_group in optimizer.param_groups:
-        param_group["lr"] = current_lr
+        param_group["lr"] = current_lr * float(param_group.get("lr_scale", 1.0))
 
     return optimizer, current_lr
 
@@ -243,9 +241,54 @@ if __name__=="__main__":
     model.cuda()
 
     # initialize optimizer
-    optimizer = torch.optim.Adam(model.parameters(),
-                                 lr=config.cos_lr_max,
-                                 weight_decay=config.weight_decay)
+    semantic_modules = (
+        model.interaction_encoder,
+        model.intent_prior,
+        model.intent_posterior,
+        model.future_token_decoder,
+        model.intent_film,
+        model.intent_norm_h,
+        model.intent_norm_r,
+    )
+    semantic_parameter_ids = {
+        id(parameter)
+        for module in semantic_modules
+        for parameter in module.parameters()
+        if parameter.requires_grad
+    }
+    semantic_lr_scale = (
+        float(getattr(config.intent, "pretrained_semantic_lr_scale", 0.1))
+        if args.stage == 2
+        else 1.0
+    )
+    if not 0.0 < semantic_lr_scale <= 1.0:
+        raise ValueError("intent.pretrained_semantic_lr_scale must be in (0, 1]")
+    base_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) not in semantic_parameter_ids
+    ]
+    semantic_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) in semantic_parameter_ids
+    ]
+    optimizer = torch.optim.Adam(
+        [
+            {
+                "params": base_parameters,
+                "lr": config.cos_lr_max,
+                "lr_scale": 1.0,
+            },
+            {
+                "params": semantic_parameters,
+                "lr": config.cos_lr_max * semantic_lr_scale,
+                "lr_scale": semantic_lr_scale,
+            },
+        ],
+        lr=config.cos_lr_max,
+        weight_decay=config.weight_decay,
+    )
 
     # ensure_dir(config.snapshot_dir)
     logger = get_logger(config.log_file, 'train')
@@ -274,8 +317,9 @@ if __name__=="__main__":
         ]
         if args.stage == 2 and critical_missing:
             raise RuntimeError(
-                "Stage-1 checkpoint does not contain the new intent modules. "
-                f"Rerun H-H pretraining first. Missing: {critical_missing}"
+                "Stage-1 checkpoint does not contain the current cross-attention "
+                "interaction-token/intent modules. Rerun H-H pretraining with the "
+                f"current model before Stage-2. Missing: {critical_missing}"
             )
         print_and_log_info(logger, "Loading model path from {} ".format(checkpoint_path))
         print_and_log_info(logger, "Compatible checkpoint report: {}".format(load_report))

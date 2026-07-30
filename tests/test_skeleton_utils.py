@@ -33,8 +33,8 @@ class SkeletonUtilsTest(unittest.TestCase):
             validate_scale=False,
         )
         self.assertAlmostEqual(float(canonical[0, 0, 0]), 0.0)
-        self.assertAlmostEqual(float(canonical[0, 5, 0]), 14.0, places=5)
-        self.assertAlmostEqual(float(canonical[0, 6, 0]), 16.0, places=5)
+        self.assertAlmostEqual(float(canonical[0, 5, 0]), 15.0, places=5)
+        self.assertAlmostEqual(float(canonical[0, 6, 0]), 17.0, places=5)
         self.assertAlmostEqual(float(canonical[0, 17, 0]), 1.0, places=5)
 
     def test_scene_center_preserves_inter_person_displacement(self):

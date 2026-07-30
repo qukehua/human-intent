@@ -123,22 +123,23 @@ def layout_is_compatible(joint_count: int, layout: str) -> bool:
 
 
 def _h36m32_to_optitrack21(motion: np.ndarray) -> np.ndarray:
-    # Human3.6M 32-joint position order. OptiTrack has explicit shoulder
-    # (clavicle) joints, which H36M does not, so use neck/upper-arm midpoints.
+    # Human3.6M 32-joint position order. Static end sites are intentionally
+    # ignored. OptiTrack has explicit clavicles, which H36M does not, so use
+    # thorax/shoulder midpoints for those two joints.
     output = np.empty((motion.shape[0], 21, 3), dtype=np.float32)
     output[:, 0] = motion[:, 0]  # Hips
-    output[:, 1] = motion[:, 11]  # Spine
-    output[:, 2] = 0.5 * (motion[:, 11] + motion[:, 12])  # Spine1
-    output[:, 3] = motion[:, 12]  # Neck
-    output[:, 4] = motion[:, 14]  # Head
-    output[:, 5] = 0.5 * (motion[:, 12] + motion[:, 16])  # LeftShoulder
-    output[:, 6] = motion[:, 16]  # LeftArm
-    output[:, 7] = motion[:, 17]  # LeftForeArm
-    output[:, 8] = motion[:, 18]  # LeftHand/wrist
-    output[:, 9] = 0.5 * (motion[:, 12] + motion[:, 23])  # RightShoulder
-    output[:, 10] = motion[:, 23]  # RightArm
-    output[:, 11] = motion[:, 24]  # RightForeArm
-    output[:, 12] = motion[:, 25]  # RightHand/wrist
+    output[:, 1] = motion[:, 12]  # Spine
+    output[:, 2] = motion[:, 13]  # Spine1 / thorax
+    output[:, 3] = motion[:, 14]  # Neck
+    output[:, 4] = motion[:, 15]  # Head
+    output[:, 5] = 0.5 * (motion[:, 13] + motion[:, 17])  # LeftShoulder
+    output[:, 6] = motion[:, 17]  # LeftArm
+    output[:, 7] = motion[:, 18]  # LeftForeArm
+    output[:, 8] = motion[:, 19]  # LeftHand/wrist
+    output[:, 9] = 0.5 * (motion[:, 13] + motion[:, 25])  # RightShoulder
+    output[:, 10] = motion[:, 25]  # RightArm
+    output[:, 11] = motion[:, 26]  # RightForeArm
+    output[:, 12] = motion[:, 27]  # RightHand/wrist
     output[:, 13] = motion[:, 6]  # LeftUpLeg
     output[:, 14] = motion[:, 7]  # LeftLeg
     output[:, 15] = motion[:, 8]  # LeftFoot

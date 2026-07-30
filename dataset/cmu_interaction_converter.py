@@ -449,20 +449,27 @@ def cmu_endpoints_to_canonical21(endpoints: dict[str, np.ndarray]) -> np.ndarray
 
 def lowpass_downsample(
     motion: np.ndarray,
-    source_fps: int = CMU_SOURCE_FPS,
-    target_fps: int = 30,
+    source_fps: float = CMU_SOURCE_FPS,
+    target_fps: float = 30,
 ) -> np.ndarray:
-    """Windowed-sinc antialiasing followed by integer-rate decimation."""
+    """Windowed-sinc antialiasing followed by arbitrary-rate resampling."""
 
     values = np.asarray(motion, dtype=np.float64)
-    if source_fps == target_fps:
+    if values.ndim < 1 or values.shape[0] < 1:
+        raise ValueError(f"Motion must contain at least one frame, got {values.shape}")
+    source_fps = float(source_fps)
+    target_fps = float(target_fps)
+    if not np.isfinite(source_fps) or not np.isfinite(target_fps):
+        raise ValueError("Frame rates must be finite")
+    if source_fps <= 0 or target_fps <= 0 or target_fps > source_fps:
+        raise ValueError(f"Expected positive downsampling rates, got {source_fps}->{target_fps}")
+    if np.isclose(source_fps, target_fps):
         return values.astype(np.float32)
-    if source_fps <= 0 or target_fps <= 0 or source_fps % target_fps != 0:
-        raise ValueError(f"Only integer downsampling is supported, got {source_fps}->{target_fps}")
-    factor = source_fps // target_fps
-    half_width = 8 * factor
+
+    ratio = target_fps / source_fps
+    half_width = int(np.ceil(8.0 / ratio))
     sample = np.arange(-half_width, half_width + 1, dtype=np.float64)
-    cutoff = 0.45 / factor
+    cutoff = 0.45 * ratio
     kernel = 2.0 * cutoff * np.sinc(2.0 * cutoff * sample)
     kernel *= np.hamming(kernel.size)
     kernel /= kernel.sum()
@@ -472,7 +479,17 @@ def lowpass_downsample(
     filtered = np.empty_like(flat)
     for column in range(flat.shape[1]):
         filtered[:, column] = np.convolve(padded[:, column], kernel, mode="valid")
-    return filtered[::factor].reshape((-1, *values.shape[1:])).astype(np.float32)
+
+    # Target samples share the source sequence's first timestamp. Filtering
+    # happens before interpolation, so non-integer ratios such as H36M's
+    # 50 Hz -> 30 Hz do not alias.
+    target_count = int(np.floor((values.shape[0] - 1) * ratio)) + 1
+    source_time = np.arange(values.shape[0], dtype=np.float64) / source_fps
+    target_time = np.arange(target_count, dtype=np.float64) / target_fps
+    output = np.empty((target_count, flat.shape[1]), dtype=np.float64)
+    for column in range(flat.shape[1]):
+        output[:, column] = np.interp(target_time, source_time, filtered[:, column])
+    return output.reshape((-1, *values.shape[1:])).astype(np.float32)
 
 
 def _median_extent(motion: np.ndarray) -> float:

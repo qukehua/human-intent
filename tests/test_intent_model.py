@@ -1,7 +1,10 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+
+import numpy as np
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +17,7 @@ except ModuleNotFoundError:
 
 if torch is not None:
     from network.model import AINet
+    from pretrain import H2HPretrainDataset
 
 
 def make_config(partner_joints=3):
@@ -103,7 +107,8 @@ class IntentModelTest(unittest.TestCase):
         self.assertIsNone(model.last_posterior_mu)
         self.assertTrue(torch.count_nonzero(model.last_kl_per_sample) == 0)
 
-    def test_synthetic_pair_mask_blocks_interaction_gradients(self):
+    def test_h2h_pair_trains_cross_attention_token_and_intent_modules(self):
+        torch.manual_seed(2)
         model = AINet(make_config())
         model.train()
         pred_a, *_ = model(
@@ -111,18 +116,80 @@ class IntentModelTest(unittest.TestCase):
             torch.randn(2, 8, 9),
             history_motion1=torch.randn(2, 8, 9),
             history_motion2=torch.randn(2, 8, 9),
-            interaction_valid=torch.zeros(2),
+            future_motion1=torch.randn(2, 3, 9),
+            future_motion2=torch.randn(2, 3, 9),
+            interaction_valid=torch.ones(2),
         )
-        pred_a.square().mean().backward()
+        loss = (
+            pred_a.square().mean()
+            + model.last_pred_partner.square().mean()
+            + model.last_kl_per_sample.mean()
+            + model.last_intent_token_loss_per_sample.mean()
+        )
+        loss.backward()
 
         cross_grads = [parameter.grad for parameter in model.cross_blocks.parameters()]
+        token_cross_grads = [
+            parameter.grad for parameter in model.interaction_encoder.cross_attention.parameters()
+        ]
         prior_grads = [parameter.grad for parameter in model.intent_prior.parameters()]
-        self.assertTrue(
-            all(gradient is None or torch.count_nonzero(gradient) == 0 for gradient in cross_grads)
-        )
-        self.assertTrue(
-            all(gradient is None or torch.count_nonzero(gradient) == 0 for gradient in prior_grads)
-        )
+        posterior_grads = [parameter.grad for parameter in model.intent_posterior.parameters()]
+        decoder_grads = [parameter.grad for parameter in model.future_token_decoder.parameters()]
+
+        def has_nonzero_gradient(gradients):
+            return any(
+                gradient is not None and torch.count_nonzero(gradient).item() > 0
+                for gradient in gradients
+            )
+
+        self.assertTrue(has_nonzero_gradient(cross_grads))
+        self.assertTrue(has_nonzero_gradient(token_cross_grads))
+        self.assertTrue(has_nonzero_gradient(prior_grads))
+        self.assertTrue(has_nonzero_gradient(posterior_grads))
+        self.assertTrue(has_nonzero_gradient(decoder_grads))
+
+    def test_synthetic_npz_uses_source_intent_eligibility_not_provenance_mask(self):
+        motion = np.zeros((12, 21, 3), dtype=np.float32)
+        motion[:, :, 1] = np.linspace(0.0, 0.2, 12, dtype=np.float32)[:, None]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            np.savez_compressed(
+                path / "synthetic_pair.npz",
+                person_a=motion,
+                person_b=motion + np.float32(1.0),
+                joint_layout="optitrack21",
+                unit="m",
+                unit_scale_to_m=np.float32(1.0),
+                synthetic=np.bool_(True),
+                interaction_valid=np.float32(0.0),
+            )
+            cfg = {
+                "datasets": {
+                    "normalization": {
+                        "target_layout": "optitrack21",
+                        "unit": "m",
+                        "root_center": True,
+                        "validate_scale": False,
+                    },
+                    "sources": [
+                        {
+                            "name": "synthetic-test",
+                            "path": str(path),
+                            "enabled": True,
+                            "intent_supervision": True,
+                        }
+                    ],
+                }
+            }
+            dataset = H2HPretrainDataset(cfg, obs_len=8, pred_len=3)
+            _, _, intent_mask = dataset[0]
+
+        self.assertEqual(intent_mask.item(), 1.0)
+        self.assertTrue(dataset.intent_flags[0])
+        self.assertFalse(dataset.recorded_pair_flags[0])
+        self.assertTrue(dataset.synthetic_flags[0])
+        self.assertEqual(dataset.sample_sources[0], "synthetic-test")
+        self.assertEqual(dataset.source_window_counts["synthetic-test"], 2)
 
     def test_stage1_checkpoint_loads_into_larger_robot_skeleton(self):
         stage1 = AINet(make_config(partner_joints=3))
@@ -137,6 +204,23 @@ class IntentModelTest(unittest.TestCase):
             if key.startswith(("interaction_encoder.", "intent_prior.", "intent_posterior."))
         ]
         self.assertEqual(critical_missing, [])
+        token_cross_key = "interaction_encoder.cross_attention.spatial.in_proj_weight"
+        torch.testing.assert_close(
+            stage2.state_dict()[token_cross_key],
+            stage1.state_dict()[token_cross_key],
+        )
+
+        stage2.set_stage(2)
+        stage2.eval()
+        with torch.no_grad():
+            prediction, *_ = stage2(
+                torch.randn(2, 8, 9),
+                torch.randn(2, 8, 12),
+                history_motion1=torch.randn(2, 8, 9),
+                history_motion2=torch.randn(2, 8, 12),
+            )
+        self.assertEqual(tuple(prediction.shape), (2, 8, 9))
+        self.assertEqual(tuple(stage2.last_interaction_token.shape), (2, 16))
 
     def test_stage2_freezes_only_the_human_motion_backbone(self):
         model = AINet(make_config(partner_joints=4))

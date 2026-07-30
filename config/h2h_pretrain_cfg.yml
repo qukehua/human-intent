@@ -22,6 +22,7 @@ intent:
   kl_warmup_steps: 10000
   token_prediction_weight: 0.1
   partner_prediction_weight: 1.0
+  balance_sources: true
   real_pair_sampling_weight: 4.0
   freeze_human_backbone_stage2: true
 
@@ -64,49 +65,60 @@ datasets:
       keys: [person_a, person_b]
       joint_layout: optitrack21
       unit_scale: 1.0
+      intent_supervision: true
 
     - name: 3DPW
-      path: /data/user/qkh/datasets/3DPW/data_aug
+      path: D:/datasets/3DPW/3DPW/data_aug
       split: train
       is_multi_person: true
       format: npz
       keys: [person_a, person_b]
-      joint_layout: smpl24
+      joint_layout: optitrack21
       unit_scale: 1.0
+      intent_supervision: true
 
     - name: amass
-      path: /data/user/qkh/datasets/amass/data_aug
+      path: D:/datasets/amass/amass/data_aug
       split: train
       is_multi_person: false
       converted_to_multi_person: true
       format: npz
       keys: [person_a, person_b]
-      joint_layout: smpl24
+      joint_layout: optitrack21
       unit_scale: 1.0
+      intent_supervision: true
 
     - name: h3.6m
-      path: /data/user/qkh/datasets/h3.6m/data_aug
+      path: D:/datasets/h3.6m/h3.6m/data_aug
       split: train
       is_multi_person: false
       converted_to_multi_person: true
       format: npz
       keys: [person_a, person_b]
-      joint_layout: h36m32
-      unit_scale: 0.001
+      joint_layout: optitrack21
+      unit_scale: 1.0
+      intent_supervision: true
 
     - name: MuPots-3d
-      path: /data/user/qkh/datasets/MuPots-3d/data_aug
-      split: train
+      path: D:/datasets/MuPots-3d/MuPots-3d
+      split: test
       is_multi_person: true
       format: npz
       enabled: false
+      intent_supervision: false
+      reason: multi-person 3-D pose test benchmark; excluded to prevent test leakage
 
 preprocess:
-  script: /data/user/qkh/human_to_robot/dataset/data_prepocess.py
+  script: D:/code/hrc/code/Human_to_Robot/dataset/data_prepocess.py
   out_folder_name: data_aug
-  max_files_per_dataset: 200
+  max_files_per_dataset: 0
+  target_fps: 30
+  smplh_model_dir: D:/datasets/amass/body_models
+  smplh_joint_backend: numpy
   augment_single_person:
     enable: true
-    methods: [copy, rotate_z, mirror_x]
-    rotate_deg: [25, 40]
-    x_offset: 0.6
+    datasets: [amass, h3.6m]
+    method: random_cross_sequence_shared_scene
+    min_pair_distance_m: 0.8
+    max_pair_distance_m: 2.0
+    intent_supervision: true

@@ -127,6 +127,12 @@ class CmuInteractionConverterTest(unittest.TestCase):
         self.assertEqual(output.shape, (31, 21, 3))
         np.testing.assert_allclose(output, 2.5, atol=1.0e-6)
 
+    def test_lowpass_downsample_supports_non_integer_ratio(self):
+        motion = np.full((101, 21, 3), -1.25, dtype=np.float32)
+        output = lowpass_downsample(motion, source_fps=50, target_fps=30)
+        self.assertEqual(output.shape, (61, 21, 3))
+        np.testing.assert_allclose(output, -1.25, atol=1.0e-6)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -47,6 +47,7 @@ intent:
   token_prediction_weight: 0.1
   robot_prediction_weight: 1.0
   freeze_human_backbone_stage2: true
+  pretrained_semantic_lr_scale: 0.1
   sample_at_inference: false
 
 batch_size: 256

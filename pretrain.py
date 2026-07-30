@@ -46,7 +46,11 @@ class H2HPretrainDataset(Dataset):
         self.target_joints = target_joints
         self.files = []
         self.index = []
-        self.interaction_flags = []
+        self.intent_flags = []
+        self.recorded_pair_flags = []
+        self.synthetic_flags = []
+        self.sample_sources = []
+        self.source_window_counts = {}
         normalisation = cfg.get("datasets", {}).get("normalization", {})
         target_layout = str(normalisation.get("target_layout", "optitrack21")).lower()
         target_unit = str(normalisation.get("unit", "m")).lower()
@@ -64,9 +68,16 @@ class H2HPretrainDataset(Dataset):
         for src in sources:
             if not src.get("enabled", True):
                 continue
+            source_name = str(src.get("name", src["path"]))
             p = Path(src["path"])
             if not p.exists():
+                warnings.warn(
+                    f"Enabled H2H source does not exist and will be skipped: "
+                    f"{source_name} ({p})",
+                    stacklevel=2,
+                )
                 continue
+            self.source_window_counts.setdefault(source_name, 0)
             for fp in sorted(p.glob("*.npz")):
                 try:
                     with np.load(fp, allow_pickle=True) as z:
@@ -83,6 +94,32 @@ class H2HPretrainDataset(Dataset):
                                 z,
                                 "synthetic",
                                 src.get("converted_to_multi_person", False),
+                            )
+                        )
+                        file_intent_enabled = bool(
+                            _npz_scalar(z, "intent_training_eligible", True)
+                        )
+                        source_intent_enabled = bool(
+                            src.get("intent_supervision", file_intent_enabled)
+                        )
+                        file_interaction_valid = bool(
+                            _npz_scalar(
+                                z,
+                                "interaction_valid",
+                                not synthetic,
+                            )
+                        )
+                        # Training eligibility and data provenance are separate.
+                        # Random AMASS/H36M pairs are valid for the trajectory
+                        # latent and cross-attention token when the source is
+                        # enabled, while recorded synchronous pairs retain a
+                        # higher sampling weight below.
+                        intent_valid = source_intent_enabled and file_intent_enabled
+                        recorded_pair = bool(
+                            _npz_scalar(
+                                z,
+                                "recorded_synchronous",
+                                file_interaction_valid and not synthetic,
                             )
                         )
 
@@ -113,10 +150,19 @@ class H2HPretrainDataset(Dataset):
                     continue
 
                 file_id = len(self.files)
-                self.files.append((fp, layout, unit_scale, synthetic))
-                for st in range(0, t - self.win + 1):
+                self.files.append((fp, layout, unit_scale, intent_valid, recorded_pair, synthetic))
+                window_count = t - self.win + 1
+                self.source_window_counts[source_name] += window_count
+                for st in range(0, window_count):
                     self.index.append((file_id, st))
-                    self.interaction_flags.append(not synthetic)
+                    self.intent_flags.append(intent_valid)
+                    self.recorded_pair_flags.append(recorded_pair)
+                    self.synthetic_flags.append(synthetic)
+                    self.sample_sources.append(source_name)
+
+        # Compatibility alias for callers that used the old field.  Its
+        # semantics are now "eligible for interaction/intent training".
+        self.interaction_flags = self.intent_flags
 
         if skipped:
             warnings.warn(
@@ -130,7 +176,7 @@ class H2HPretrainDataset(Dataset):
 
     def __getitem__(self, idx):
         file_id, st = self.index[idx]
-        fp, layout, unit_scale, synthetic = self.files[file_id]
+        fp, layout, unit_scale, intent_valid, _, _ = self.files[file_id]
         with np.load(fp, allow_pickle=True) as z:
             a = canonicalize_motion(
                 z["person_a"],
@@ -153,10 +199,10 @@ class H2HPretrainDataset(Dataset):
 
         motion_input = data[: self.obs_len]
         motion_target = data[self.obs_len :]
-        # Synthetic pairs still pretrain the motion backbone, but they must not
-        # supervise the human-human interaction latent.
-        interaction_valid = torch.tensor(0.0 if synthetic else 1.0, dtype=torch.float32)
-        return torch.from_numpy(motion_input), torch.from_numpy(motion_target), interaction_valid
+        # This mask controls cross-attention, interaction-token, KL and latent
+        # conditioning.  Provenance is tracked separately for sampling.
+        intent_mask = torch.tensor(float(intent_valid), dtype=torch.float32)
+        return torch.from_numpy(motion_input), torch.from_numpy(motion_target), intent_mask
 
 
 def gen_velocity(m):
@@ -218,19 +264,27 @@ def main():
     dataset = H2HPretrainDataset(cfg, obs_len=obs_len, pred_len=pred_len, target_joints=target_joints)
     if len(dataset) == 0:
         raise RuntimeError("No valid training windows found. Check data_aug files and cfg paths.")
-    real_pair_count = int(sum(dataset.interaction_flags))
-    if real_pair_count == 0:
-        raise RuntimeError(
-            "No real human-human pairs were found. Intent latent training requires at least one "
-            "non-synthetic interaction source."
-        )
+    intent_pair_count = int(sum(dataset.intent_flags))
+    recorded_pair_count = int(sum(dataset.recorded_pair_flags))
+    synthetic_pair_count = int(sum(dataset.synthetic_flags))
+    if intent_pair_count == 0:
+        raise RuntimeError("No H2H windows are enabled for interaction-token/intent training.")
     real_pair_sampling_weight = float(intent_cfg.get("real_pair_sampling_weight", 4.0))
     if real_pair_sampling_weight <= 0:
         raise ValueError("intent.real_pair_sampling_weight must be positive")
-    sample_weights = torch.tensor(
-        [real_pair_sampling_weight if is_real else 1.0 for is_real in dataset.interaction_flags],
-        dtype=torch.double,
-    )
+    balance_sources = bool(intent_cfg.get("balance_sources", True))
+    sample_weight_values = []
+    source_sampling_mass = {name: 0.0 for name in dataset.source_window_counts}
+    for is_recorded, source_name in zip(
+        dataset.recorded_pair_flags,
+        dataset.sample_sources,
+    ):
+        weight = (real_pair_sampling_weight if is_recorded else 1.0) / (
+            dataset.source_window_counts[source_name] if balance_sources else 1.0
+        )
+        sample_weight_values.append(weight)
+        source_sampling_mass[source_name] += weight
+    sample_weights = torch.tensor(sample_weight_values, dtype=torch.double)
     sampler = WeightedRandomSampler(sample_weights, num_samples=len(dataset), replacement=True)
     loader = DataLoader(
         dataset,
@@ -240,9 +294,16 @@ def main():
         drop_last=True,
     )
     print(
-        f"H2H windows: {len(dataset)} total, {real_pair_count} real interaction "
-        f"({real_pair_count / len(dataset):.1%}); real-pair sampling weight={real_pair_sampling_weight:g}"
+        f"H2H windows: {len(dataset)} total, {intent_pair_count} intent-enabled "
+        f"({intent_pair_count / len(dataset):.1%}), {recorded_pair_count} recorded synchronous, "
+        f"{synthetic_pair_count} synthetic; source balancing={balance_sources}, "
+        f"recorded-pair sampling weight={real_pair_sampling_weight:g}"
     )
+    total_sampling_mass = float(sample_weights.sum())
+    print("H2H windows and expected sampling share by source:")
+    for name, count in dataset.source_window_counts.items():
+        share = source_sampling_mass[name] / total_sampling_mass
+        print(f"  {name}: {count} windows, {share:.1%} sampled")
 
     config = build_h2h_model_config(cfg)
 
@@ -259,10 +320,10 @@ def main():
     step = 0
     for ep in range(epochs):
         pbar = tqdm(loader, desc=f"pretrain epoch {ep+1}/{epochs}")
-        for motion_input, motion_target, interaction_valid in pbar:
+        for motion_input, motion_target, intent_valid in pbar:
             motion_input = motion_input.cuda()  # [B,T,126]
             motion_target = motion_target.cuda()  # [B,P,126]
-            interaction_valid = interaction_valid.cuda()
+            intent_valid = intent_valid.cuda()
             b, t, _ = motion_input.shape
             in_features = target_joints * coord_dim
 
@@ -280,7 +341,7 @@ def main():
                 history_motion2=src2,
                 future_motion1=tgt1,
                 future_motion2=tgt2,
-                interaction_valid=interaction_valid,
+                interaction_valid=intent_valid,
             )
             pred2_dct = model.last_pred_partner
             # The model predicts DCT coefficients. Convert them back to time
@@ -311,10 +372,10 @@ def main():
             )
 
             kl_warmup = min(1.0, float(step + 1) / float(kl_warmup_steps))
-            loss_kl = masked_mean(model.last_kl_per_sample, interaction_valid)
+            loss_kl = masked_mean(model.last_kl_per_sample, intent_valid)
             loss_intent_token = masked_mean(
                 model.last_intent_token_loss_per_sample,
-                interaction_valid,
+                intent_valid,
             )
             total = (
                 lambda_pre * loss_pre
@@ -335,7 +396,7 @@ def main():
                     "rec": f"{loss_rec.item():.4f}",
                     "kl": f"{loss_kl.item():.4f}",
                     "intent": f"{loss_intent_token.item():.4f}",
-                    "real_pair": f"{interaction_valid.mean().item():.2f}",
+                    "intent_valid": f"{intent_valid.mean().item():.2f}",
                 }
             )
 

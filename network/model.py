@@ -134,23 +134,30 @@ class JointGatedFusion(nn.Module):
 
 
 class InteractionTokenEncoder(nn.Module):
-    """Encode two native skeleton streams into a joint-count agnostic token."""
+    """Pool bidirectional cross-attention features into an interaction token.
+
+    The point encoder is shared by both agents and the cross-attention block
+    accepts different joint counts.  Consequently the same Stage-1 token
+    encoder can be reused for human-human (21/21) and human-robot (21/N)
+    sequences without learning a fixed joint-to-joint correspondence.
+    """
 
     def __init__(self, embed_dim: int, num_heads: int, dropout: float):
         super().__init__()
         point_hidden = max(embed_dim // 2, 32)
         self.point_encoder = nn.Sequential(
-            nn.Linear(6, point_hidden),
+            nn.Linear(9, point_hidden),
             nn.GELU(),
             nn.Linear(point_hidden, embed_dim),
         )
+        self.cross_attention = STCrossAttention(embed_dim, num_heads, dropout)
         self.frame_projection = nn.Sequential(
             nn.Linear(embed_dim * 2, embed_dim),
             nn.GELU(),
             nn.LayerNorm(embed_dim),
         )
         self.relation_projection = nn.Sequential(
-            nn.Linear(embed_dim * 4 + 14, embed_dim),
+            nn.Linear(embed_dim * 4, embed_dim),
             nn.GELU(),
             nn.LayerNorm(embed_dim),
         )
@@ -159,7 +166,7 @@ class InteractionTokenEncoder(nn.Module):
         self.pool = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
         self.norm = nn.LayerNorm(embed_dim)
 
-    def _motion_features(self, motion: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _motion_features(self, motion: torch.Tensor) -> torch.Tensor:
         # motion: B,T,J*3 in the time domain
         if motion.ndim != 3 or motion.shape[-1] % 3 != 0:
             raise ValueError(f"Expected time-domain motion [B,T,J*3], got {tuple(motion.shape)}")
@@ -171,15 +178,22 @@ class InteractionTokenEncoder(nn.Module):
             [torch.zeros_like(points[:, :1]), points[:, 1:] - points[:, :-1]],
             dim=1,
         )
-        point_features = self.point_encoder(torch.cat([relative, velocity], dim=-1))
-        pooled_mean = point_features.mean(dim=2)
-        pooled_max = point_features.amax(dim=2)
-        frame_features = self.frame_projection(torch.cat([pooled_mean, pooled_max], dim=-1))
-        root_velocity = torch.cat(
-            [torch.zeros_like(root[:, :1]), root[:, 1:] - root[:, :-1]],
-            dim=1,
-        )
-        return frame_features, root, root_velocity
+        # Scene coordinates preserve inter-agent displacement; body-relative
+        # coordinates preserve articulation. Both, plus velocity, enter cross
+        # attention before any information is pooled into the token.
+        point_input = torch.cat([points, relative, velocity], dim=-1)
+        # B,T,J,D -> B,J,T,D, the layout expected by STCrossAttention.
+        point_features = self.point_encoder(point_input)
+        point_features = point_features.permute(0, 2, 1, 3).contiguous()
+        return point_features
+
+    def _pool_cross_features(self, features: torch.Tensor) -> torch.Tensor:
+        # features: B,J,T,D.  Pooling occurs only after one agent has attended
+        # to the other, so every interaction token is derived from cross-agent
+        # features rather than independent per-person summaries.
+        pooled_mean = features.mean(dim=1)
+        pooled_max = features.amax(dim=1)
+        return self.frame_projection(torch.cat([pooled_mean, pooled_max], dim=-1))
 
     def forward(self, motion_a: torch.Tensor, motion_b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if motion_a.shape[:2] != motion_b.shape[:2]:
@@ -187,38 +201,18 @@ class InteractionTokenEncoder(nn.Module):
                 f"Interaction streams must share batch/time, got {tuple(motion_a.shape)} "
                 f"and {tuple(motion_b.shape)}"
             )
-        frame_a, root_a, velocity_a = self._motion_features(motion_a)
-        frame_b, root_b, velocity_b = self._motion_features(motion_b)
-        b, t, _ = motion_a.shape
-        points_a = motion_a.reshape(b, t, -1, 3)
-        points_b = motion_b.reshape(b, t, -1, 3)
-        pairwise_distance = torch.cdist(
-            points_a.reshape(b * t, points_a.shape[2], 3),
-            points_b.reshape(b * t, points_b.shape[2], 3),
-        ).reshape(b, t, points_a.shape[2], points_b.shape[2])
-        geometry = torch.stack(
-            [
-                pairwise_distance.amin(dim=(-2, -1)),
-                pairwise_distance.amin(dim=-1).mean(dim=-1),
-                pairwise_distance.amin(dim=-2).mean(dim=-1),
-                torch.norm(points_b.mean(dim=2) - points_a.mean(dim=2), dim=-1),
-            ],
-            dim=-1,
-        )
-        geometry_velocity = torch.cat(
-            [torch.zeros_like(geometry[:, :1]), geometry[:, 1:] - geometry[:, :-1]],
-            dim=1,
-        )
+        point_a = self._motion_features(motion_a)
+        point_b = self._motion_features(motion_b)
+        cross_a = self.cross_attention(point_a, point_b)
+        cross_b = self.cross_attention(point_b, point_a)
+        frame_a = self._pool_cross_features(cross_a)
+        frame_b = self._pool_cross_features(cross_b)
         relation = torch.cat(
             [
                 frame_a,
                 frame_b,
                 torch.abs(frame_b - frame_a),
                 frame_a * frame_b,
-                root_b - root_a,
-                velocity_b - velocity_a,
-                geometry,
-                geometry_velocity,
             ],
             dim=-1,
         )
@@ -458,8 +452,10 @@ class AINet(nn.Module):
         f_inter_h_cross = self._run_inter(f_en_h, inter_r_for_h)
         f_inter_r_cross = self._run_inter(f_en_r, inter_h_for_r)
         cross_mask = interaction_valid.reshape(-1, 1, 1, 1)
-        # Synthetic single-person pairings pretrain only the per-agent motion
-        # paths. They cannot update cross-agent interaction features.
+        # `interaction_valid` is a training-eligibility mask, not a
+        # real-vs-synthetic provenance flag.  Stage-1 enables it for every
+        # configured H-H pair so AMASS/H36M random pairs also train the
+        # cross-agent path, interaction token and intent latent.
         f_inter_h = f_en_h + cross_mask * (f_inter_h_cross - f_en_h)
         f_inter_r = f_en_r + cross_mask * (f_inter_r_cross - f_en_r)
 
