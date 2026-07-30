@@ -21,6 +21,10 @@ deriv_input: true
 deriv_output: true
 use_relative_loss: true
 
+normalization:
+  unit: m
+  root_center: true
+
 pre_dct: false
 post_dct: false
 
@@ -34,6 +38,16 @@ motion_mlp:
   with_normalization: true
   spatial_fc_only: false
   norm_axis: spatial
+
+intent:
+  token_dim: 256
+  latent_dim: 128
+  kl_weight: 1.0e-3
+  kl_warmup_steps: 5000
+  token_prediction_weight: 0.1
+  robot_prediction_weight: 1.0
+  freeze_human_backbone_stage2: true
+  sample_at_inference: false
 
 batch_size: 256
 num_workers: 2

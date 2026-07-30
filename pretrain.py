@@ -1,12 +1,14 @@
 import argparse
+import warnings
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 
 from config.config_utils import build_h2h_model_config, load_yaml
+from dataset.skeleton_utils import canonicalize_motion, scene_center_pair
 from network.model import AINet
 
 
@@ -22,75 +24,148 @@ def get_dct_matrix(n: int):
     return dct_m, idct_m
 
 
-def adapt_joint_count(x: np.ndarray, target_joints: int) -> np.ndarray:
-    # x: [T, J, 3]
-    t, j, c = x.shape
-    assert c == 3
-    if j == target_joints:
-        return x
-    if j > target_joints:
-        return x[:, :target_joints, :]
-    out = np.zeros((t, target_joints, 3), dtype=x.dtype)
-    out[:, :j, :] = x
-    return out
+def _npz_scalar(z, key: str, default=None):
+    if key not in z.files:
+        return default
+    value = np.asarray(z[key])
+    if value.size != 1:
+        return default
+    item = value.reshape(-1)[0]
+    if isinstance(item, bytes):
+        item = item.decode("utf-8")
+    return item
 
 
 class H2HPretrainDataset(Dataset):
     def __init__(self, cfg: dict, obs_len: int, pred_len: int, target_joints: int = 21):
+        if target_joints != 21:
+            raise ValueError("H2H pretraining now uses the fixed HARPER/OptiTrack 21-joint layout")
         self.obs_len = obs_len
         self.pred_len = pred_len
         self.win = obs_len + pred_len
         self.target_joints = target_joints
         self.files = []
         self.index = []
+        self.interaction_flags = []
+        normalisation = cfg.get("datasets", {}).get("normalization", {})
+        target_layout = str(normalisation.get("target_layout", "optitrack21")).lower()
+        target_unit = str(normalisation.get("unit", "m")).lower()
+        if target_layout not in {"optitrack21", "harper21", "canonical21"}:
+            raise ValueError(f"Unsupported pretraining target layout: {target_layout}")
+        if target_unit not in {"m", "meter", "metre"}:
+            raise ValueError(f"Pretraining target coordinates must use metres, got {target_unit}")
+        self.root_center = bool(normalisation.get("root_center", True))
+        self.validate_scale = bool(normalisation.get("validate_scale", True))
+        self.min_extent_m = float(normalisation.get("min_extent_m", 0.25))
+        self.max_extent_m = float(normalisation.get("max_extent_m", 3.5))
+        skipped = 0
 
         sources = cfg.get("datasets", {}).get("sources", [])
         for src in sources:
+            if not src.get("enabled", True):
+                continue
             p = Path(src["path"])
             if not p.exists():
                 continue
-            self.files.extend(sorted(p.glob("*.npz")))
+            for fp in sorted(p.glob("*.npz")):
+                try:
+                    with np.load(fp, allow_pickle=True) as z:
+                        if "person_a" not in z.files or "person_b" not in z.files:
+                            # Skip index-only files (e.g. current MuPots files).
+                            skipped += 1
+                            continue
+                        layout = str(_npz_scalar(z, "joint_layout", src.get("joint_layout", "auto")))
+                        unit = str(_npz_scalar(z, "unit", "")).lower()
+                        default_scale = 1.0 if unit in {"m", "meter", "metre"} else src.get("unit_scale", 1.0)
+                        unit_scale = float(_npz_scalar(z, "unit_scale_to_m", default_scale))
+                        synthetic = bool(
+                            _npz_scalar(
+                                z,
+                                "synthetic",
+                                src.get("converted_to_multi_person", False),
+                            )
+                        )
 
-        # Build a lightweight sliding window index.
-        for fp in self.files:
-            try:
-                z = np.load(fp, allow_pickle=True)
-                if "person_a" not in z.files or "person_b" not in z.files:
-                    # Skip index-only files (e.g., current MuPots data_aug).
+                        # Validate semantics, finiteness and metric scale before
+                        # adding any windows, so bad files never fail mid-epoch.
+                        a = canonicalize_motion(
+                            z["person_a"],
+                            layout,
+                            unit_scale,
+                            validate_scale=self.validate_scale,
+                            min_extent_m=self.min_extent_m,
+                            max_extent_m=self.max_extent_m,
+                        )
+                        b = canonicalize_motion(
+                            z["person_b"],
+                            layout,
+                            unit_scale,
+                            validate_scale=self.validate_scale,
+                            min_extent_m=self.min_extent_m,
+                            max_extent_m=self.max_extent_m,
+                        )
+                        t = min(a.shape[0], b.shape[0])
+                        if t < self.win:
+                            skipped += 1
+                            continue
+                except (OSError, ValueError, KeyError):
+                    skipped += 1
                     continue
-                ta = z["person_a"].shape[0]
-                tb = z["person_b"].shape[0]
-                t = min(ta, tb)
-                if t < self.win:
-                    continue
-                for st in range(0, t - self.win + 1, 1):
-                    self.index.append((fp, st))
-            except Exception:
-                continue
+
+                file_id = len(self.files)
+                self.files.append((fp, layout, unit_scale, synthetic))
+                for st in range(0, t - self.win + 1):
+                    self.index.append((file_id, st))
+                    self.interaction_flags.append(not synthetic)
+
+        if skipped:
+            warnings.warn(
+                f"Skipped {skipped} H2H files with missing trajectories, incompatible joints, "
+                "invalid coordinates/scale, or insufficient frames.",
+                stacklevel=2,
+            )
 
     def __len__(self):
         return len(self.index)
 
     def __getitem__(self, idx):
-        fp, st = self.index[idx]
-        z = np.load(fp, allow_pickle=True)
-        a = z["person_a"].astype(np.float32)
-        b = z["person_b"].astype(np.float32)
-
-        a = adapt_joint_count(a, self.target_joints)
-        b = adapt_joint_count(b, self.target_joints)
+        file_id, st = self.index[idx]
+        fp, layout, unit_scale, synthetic = self.files[file_id]
+        with np.load(fp, allow_pickle=True) as z:
+            a = canonicalize_motion(
+                z["person_a"],
+                layout,
+                unit_scale,
+                validate_scale=False,
+            )
+            b = canonicalize_motion(
+                z["person_b"],
+                layout,
+                unit_scale,
+                validate_scale=False,
+            )
 
         a = a[st : st + self.win]  # [win, J, 3]
         b = b[st : st + self.win]
+        if self.root_center:
+            a, b = scene_center_pair(a, b)
         data = np.concatenate([a.reshape(self.win, -1), b.reshape(self.win, -1)], axis=-1)  # [win, 2*J*3]
 
         motion_input = data[: self.obs_len]
         motion_target = data[self.obs_len :]
-        return torch.from_numpy(motion_input), torch.from_numpy(motion_target)
+        # Synthetic pairs still pretrain the motion backbone, but they must not
+        # supervise the human-human interaction latent.
+        interaction_valid = torch.tensor(0.0 if synthetic else 1.0, dtype=torch.float32)
+        return torch.from_numpy(motion_input), torch.from_numpy(motion_target), interaction_valid
 
 
 def gen_velocity(m):
     return m[:, 1:] - m[:, :-1]
+
+
+def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask = mask.to(device=values.device, dtype=values.dtype).reshape(-1)
+    return torch.sum(values.reshape(-1) * mask) / torch.clamp(mask.sum(), min=1.0)
 
 
 def parse_args():
@@ -115,6 +190,18 @@ def main():
     pred_len = int(cfg["sequence"]["pred_len"])
     coord_dim = int(cfg["sequence"].get("coord_dim", 3))
     target_joints = int(cfg["sequence"].get("target_joints", 21))
+    relative_output = bool(cfg["sequence"].get("relative_output", True))
+    if coord_dim != 3:
+        raise ValueError(f"Only xyz coordinates are supported, got coord_dim={coord_dim}")
+    domains = {
+        "input": str(cfg["sequence"].get("input_domain", "dct")).lower(),
+        "output": str(cfg["sequence"].get("output_domain", "dct")).lower(),
+        "supervision": str(cfg["sequence"].get("supervision_domain", "time")).lower(),
+        "reconstruction": str(cfg["sequence"].get("reconstruction_domain", "dct")).lower(),
+    }
+    expected_domains = {"input": "dct", "output": "dct", "supervision": "time", "reconstruction": "dct"}
+    if domains != expected_domains:
+        raise ValueError(f"Unsupported domain configuration {domains}; expected {expected_domains}")
     batch_size = int(cfg["train"]["batch_size"])
     epochs = int(cfg["train"]["epochs"])
     num_workers = int(cfg["train"]["num_workers"])
@@ -122,11 +209,40 @@ def main():
     weight_decay = float(cfg["train"]["weight_decay"])
     lambda_pre = float(cfg["train"]["lambda_pre"])
     lambda_rec = float(cfg["train"]["lambda_rec"])
+    intent_cfg = cfg.get("intent", {})
+    lambda_partner = float(intent_cfg.get("partner_prediction_weight", 1.0))
+    lambda_kl = float(intent_cfg.get("kl_weight", 1.0e-3))
+    lambda_intent_token = float(intent_cfg.get("token_prediction_weight", 0.1))
+    kl_warmup_steps = max(1, int(intent_cfg.get("kl_warmup_steps", 10000)))
 
     dataset = H2HPretrainDataset(cfg, obs_len=obs_len, pred_len=pred_len, target_joints=target_joints)
     if len(dataset) == 0:
         raise RuntimeError("No valid training windows found. Check data_aug files and cfg paths.")
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
+    real_pair_count = int(sum(dataset.interaction_flags))
+    if real_pair_count == 0:
+        raise RuntimeError(
+            "No real human-human pairs were found. Intent latent training requires at least one "
+            "non-synthetic interaction source."
+        )
+    real_pair_sampling_weight = float(intent_cfg.get("real_pair_sampling_weight", 4.0))
+    if real_pair_sampling_weight <= 0:
+        raise ValueError("intent.real_pair_sampling_weight must be positive")
+    sample_weights = torch.tensor(
+        [real_pair_sampling_weight if is_real else 1.0 for is_real in dataset.interaction_flags],
+        dtype=torch.double,
+    )
+    sampler = WeightedRandomSampler(sample_weights, num_samples=len(dataset), replacement=True)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        drop_last=True,
+    )
+    print(
+        f"H2H windows: {len(dataset)} total, {real_pair_count} real interaction "
+        f"({real_pair_count / len(dataset):.1%}); real-pair sampling weight={real_pair_sampling_weight:g}"
+    )
 
     config = build_h2h_model_config(cfg)
 
@@ -143,34 +259,69 @@ def main():
     step = 0
     for ep in range(epochs):
         pbar = tqdm(loader, desc=f"pretrain epoch {ep+1}/{epochs}")
-        for motion_input, motion_target in pbar:
+        for motion_input, motion_target, interaction_valid in pbar:
             motion_input = motion_input.cuda()  # [B,T,126]
             motion_target = motion_target.cuda()  # [B,P,126]
+            interaction_valid = interaction_valid.cuda()
             b, t, _ = motion_input.shape
             in_features = target_joints * coord_dim
 
             src1 = motion_input[:, :, :in_features]
             src2 = motion_input[:, :, in_features:]
+            tgt1 = motion_target[:, :, :in_features]
+            tgt2 = motion_target[:, :, in_features:]
             src1_dct = torch.matmul(dct_m[:, :, :obs_len], src1)
             src2_dct = torch.matmul(dct_m[:, :, :obs_len], src2)
 
-            pred1, _, _, _, _ = model(src1_dct, src2_dct)
-            pred1 = pred1[:, :pred_len]
+            pred1_dct, _, _, _, _ = model(
+                src1_dct,
+                src2_dct,
+                history_motion1=src1,
+                history_motion2=src2,
+                future_motion1=tgt1,
+                future_motion2=tgt2,
+                interaction_valid=interaction_valid,
+            )
+            pred2_dct = model.last_pred_partner
+            # The model predicts DCT coefficients. Convert them back to time
+            # before comparing with the time-domain future target.
+            pred1_time = torch.matmul(idct_m, pred1_dct)[:, :pred_len]
+            pred2_time = torch.matmul(idct_m, pred2_dct)[:, :pred_len]
+            if relative_output:
+                pred1_time = pred1_time + src1[:, -1:, :]
+                pred2_time = pred2_time + src2[:, -1:, :]
 
-            tgt1 = motion_target[:, :, :in_features]
-            loss_pre = torch.mean(torch.norm(pred1 - tgt1, dim=-1))
+            pred1_xyz = pred1_time.reshape(b, pred_len, target_joints, coord_dim)
+            pred2_xyz = pred2_time.reshape(b, pred_len, target_joints, coord_dim)
+            tgt1_xyz = tgt1.reshape(b, pred_len, target_joints, coord_dim)
+            tgt2_xyz = tgt2.reshape(b, pred_len, target_joints, coord_dim)
+            loss_person1 = torch.mean(torch.norm(pred1_xyz - tgt1_xyz, dim=-1))
+            loss_person2 = torch.mean(torch.norm(pred2_xyz - tgt2_xyz, dim=-1))
+            loss_pre = loss_person1 + lambda_partner * loss_person2
 
             rec1 = model.last_recon_h
             rec2 = model.last_recon_r
-            src1_xyz = src1.reshape(b, t, target_joints, coord_dim).reshape(-1, coord_dim)
-            src2_xyz = src2.reshape(b, t, target_joints, coord_dim).reshape(-1, coord_dim)
+            # Reconstruction heads also operate in the DCT domain.
+            src1_xyz = src1_dct.reshape(b, t, target_joints, coord_dim).reshape(-1, coord_dim)
+            src2_xyz = src2_dct.reshape(b, t, target_joints, coord_dim).reshape(-1, coord_dim)
             rec1_xyz = rec1.reshape(-1, 3)
             rec2_xyz = rec2.reshape(-1, 3)
             loss_rec = torch.mean(torch.norm(rec1_xyz - src1_xyz, dim=-1)) + torch.mean(
                 torch.norm(rec2_xyz - src2_xyz, dim=-1)
             )
 
-            total = lambda_pre * loss_pre + lambda_rec * loss_rec
+            kl_warmup = min(1.0, float(step + 1) / float(kl_warmup_steps))
+            loss_kl = masked_mean(model.last_kl_per_sample, interaction_valid)
+            loss_intent_token = masked_mean(
+                model.last_intent_token_loss_per_sample,
+                interaction_valid,
+            )
+            total = (
+                lambda_pre * loss_pre
+                + lambda_rec * loss_rec
+                + lambda_kl * kl_warmup * loss_kl
+                + lambda_intent_token * loss_intent_token
+            )
             optimizer.zero_grad()
             total.backward()
             optimizer.step()
@@ -179,8 +330,12 @@ def main():
             pbar.set_postfix(
                 {
                     "loss": f"{total.item():.4f}",
-                    "pre": f"{loss_pre.item():.4f}",
+                    "p1": f"{loss_person1.item():.4f}",
+                    "p2": f"{loss_person2.item():.4f}",
                     "rec": f"{loss_rec.item():.4f}",
+                    "kl": f"{loss_kl.item():.4f}",
+                    "intent": f"{loss_intent_token.item():.4f}",
+                    "real_pair": f"{interaction_valid.mean().item():.2f}",
                 }
             )
 

@@ -6,6 +6,15 @@ from pathlib import Path
 import numpy as np
 from scipy.io import loadmat
 
+try:
+    from dataset.skeleton_utils import (
+        canonicalize_motion,
+        joint_names_array,
+        mirror_canonical_x,
+    )
+except ModuleNotFoundError:
+    from skeleton_utils import canonicalize_motion, joint_names_array, mirror_canonical_x
+
 
 def rotation_z(deg: float) -> np.ndarray:
     rad = np.deg2rad(deg)
@@ -14,10 +23,8 @@ def rotation_z(deg: float) -> np.ndarray:
 
 
 def augment_second_person(person_a: np.ndarray, rotate_deg: float = 35.0, mirror_x: bool = True) -> np.ndarray:
-    # person_a: [T, J, 3]
-    person_b = person_a.copy()
-    if mirror_x:
-        person_b[..., 0] *= -1.0
+    # person_a: canonical [T, 21, 3] in metres.
+    person_b = mirror_canonical_x(person_a) if mirror_x else person_a.copy()
     r = rotation_z(rotate_deg)
     person_b = person_b @ r.T
     person_b[..., 0] += 0.6  # lateral offset to avoid overlap
@@ -28,6 +35,27 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def save_canonical_pair(
+    out_fp: Path,
+    person_a: np.ndarray,
+    person_b: np.ndarray,
+    source: Path,
+    *,
+    synthetic: bool,
+) -> None:
+    np.savez_compressed(
+        out_fp,
+        person_a=person_a.astype(np.float32),
+        person_b=person_b.astype(np.float32),
+        source=str(source),
+        synthetic=synthetic,
+        joint_layout="optitrack21",
+        joint_names=joint_names_array(),
+        unit="m",
+        unit_scale_to_m=np.float32(1.0),
+    )
+
+
 def process_3dpw(root: Path, out_dir: Path, max_files: int) -> dict:
     files = sorted((root / "sequenceFiles").rglob("*.pkl"))
     info = {"dataset": "3DPW", "is_multi_person": True, "files_seen": len(files), "files_written": 0}
@@ -36,33 +64,64 @@ def process_3dpw(root: Path, out_dir: Path, max_files: int) -> dict:
         with open(fp, "rb") as f:
             data = pickle.load(f, encoding="latin1")
         joints = data.get("jointPositions", None)
-        if not joints or len(joints) < 2:
+        if joints is None or len(joints) < 2:
             continue
         # each person: [T, 72], reshape to [T, 24, 3]
-        p1 = np.asarray(joints[0], dtype=np.float32).reshape(-1, 24, 3)
-        p2 = np.asarray(joints[1], dtype=np.float32).reshape(-1, 24, 3)
+        try:
+            p1 = canonicalize_motion(
+                np.asarray(joints[0], dtype=np.float32).reshape(-1, 24, 3),
+                "smpl24",
+                unit_scale=1.0,
+            )
+            p2 = canonicalize_motion(
+                np.asarray(joints[1], dtype=np.float32).reshape(-1, 24, 3),
+                "smpl24",
+                unit_scale=1.0,
+            )
+        except ValueError:
+            continue
         out_fp = out_dir / f"{fp.stem}.npz"
-        np.savez_compressed(out_fp, person_a=p1, person_b=p2, source=str(fp))
+        save_canonical_pair(out_fp, p1, p2, fp, synthetic=False)
         info["files_written"] += 1
     return info
 
 
 def process_amass(root: Path, out_dir: Path, max_files: int) -> dict:
     files = sorted(root.rglob("*_poses.npz"))
-    info = {"dataset": "amass", "is_multi_person": False, "files_seen": len(files), "files_written": 0}
+    info = {
+        "dataset": "amass",
+        "is_multi_person": False,
+        "files_seen": len(files),
+        "files_written": 0,
+        "files_skipped_no_joint_positions": 0,
+    }
     ensure_dir(out_dir)
     for fp in files[:max_files]:
-        z = np.load(fp)
-        if "trans" in z.files:
-            p1 = z["trans"].astype(np.float32)[:, None, :]  # [T,1,3]
-        elif "poses" in z.files:
-            # fallback proxy joint from root orientation entries
-            p1 = z["poses"].astype(np.float32)[:, :3][:, None, :]
-        else:
+        with np.load(fp, allow_pickle=True) as z:
+            joint_key = next(
+                (key for key in ("joints", "joint_positions", "jointPositions") if key in z.files),
+                None,
+            )
+            if joint_key is None:
+                # Raw AMASS contains SMPL pose parameters, not 3-D joints.
+                # A body-model forward pass is required before this preprocessor.
+                info["files_skipped_no_joint_positions"] += 1
+                continue
+            raw_joints = np.asarray(z[joint_key], dtype=np.float32)
+        if raw_joints.ndim == 2 and raw_joints.shape[1] % 3 == 0:
+            raw_joints = raw_joints.reshape(raw_joints.shape[0], -1, 3)
+        if raw_joints.ndim != 3 or raw_joints.shape[-1] != 3:
+            info["files_skipped_no_joint_positions"] += 1
+            continue
+        layout = "optitrack21" if raw_joints.shape[1] == 21 else "smpl24"
+        try:
+            p1 = canonicalize_motion(raw_joints, layout, unit_scale=1.0)
+        except ValueError:
+            info["files_skipped_no_joint_positions"] += 1
             continue
         p2 = augment_second_person(p1, rotate_deg=25.0, mirror_x=True)
         out_fp = out_dir / f"{fp.stem}.npz"
-        np.savez_compressed(out_fp, person_a=p1, person_b=p2, source=str(fp), synthetic=True)
+        save_canonical_pair(out_fp, p1, p2, fp, synthetic=True)
         info["files_written"] += 1
     return info
 
@@ -76,10 +135,21 @@ def process_h36m(root: Path, out_dir: Path, max_files: int) -> dict:
         if arr.ndim != 2 or arr.shape[1] % 3 != 0:
             continue
         j = arr.shape[1] // 3
-        p1 = arr.reshape(arr.shape[0], j, 3)
+        if j != 32:
+            # Common 99-D H36M text exports contain exponential-map angles,
+            # not 33 XYZ joints. Never reinterpret those values as positions.
+            continue
+        try:
+            p1 = canonicalize_motion(
+                arr.reshape(arr.shape[0], j, 3),
+                "h36m32",
+                unit_scale=0.001,
+            )
+        except ValueError:
+            continue
         p2 = augment_second_person(p1, rotate_deg=40.0, mirror_x=True)
         out_fp = out_dir / f"{fp.parent.name}_{fp.stem}.npz"
-        np.savez_compressed(out_fp, person_a=p1, person_b=p2, source=str(fp), synthetic=True)
+        save_canonical_pair(out_fp, p1, p2, fp, synthetic=True)
         info["files_written"] += 1
     return info
 

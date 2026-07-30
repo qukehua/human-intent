@@ -27,7 +27,8 @@ data_root = r'/data/user/qkh/datasets/HARPER/HARPER _3D panoptic/30hz'
 
 config.motion.harper_target_length = config.motion.harper_target_length_train
 dataset = Harper3D(data_path=data_root, split="train", n_input=config.motion.harper_input_length,
-                   n_output=config.motion.harper_target_length, sample=1)
+                   n_output=config.motion.harper_target_length, sample=1,
+                   root_center=config.normalization.root_center)
 
 shuffle = True
 sampler = None
@@ -38,7 +39,8 @@ dataloader = DataLoader(dataset, batch_size=config.batch_size,
 eval_config = copy.deepcopy(config)
 eval_config.motion.harper_target_length = eval_config.motion.harper_target_length_eval
 eval_dataset = Harper3D(data_path=data_root, split="test", n_input=eval_config.motion.harper_input_length,
-                        n_output=eval_config.motion.harper_target_length, sample=1)
+                        n_output=eval_config.motion.harper_target_length, sample=1,
+                        root_center=eval_config.normalization.root_center)
 
 shuffle = False
 sampler = None
@@ -54,9 +56,13 @@ parser.add_argument('--spatial-fc', action='store_true', help='=use only spatial
 parser.add_argument('--num', type=int, default=24, help='=num of blocks')
 parser.add_argument('--weight', type=float, default=1., help='=loss weight')
 parser.add_argument('--work_dir', type=str, default=".", help='=work_dir')
-parser.add_argument('--stage', type=int, default=1, choices=[1, 2], help='training stage')
+parser.add_argument('--stage', type=int, default=2, choices=[1, 2], help='training stage')
 parser.add_argument('--lambda-pre', type=float, default=1.0, help='prediction loss weight')
 parser.add_argument('--lambda-rec', type=float, default=0.5, help='reconstruction loss weight')
+parser.add_argument('--lambda-robot', type=float, default=None, help='robot future prediction loss weight')
+parser.add_argument('--lambda-kl', type=float, default=None, help='intent KL loss weight')
+parser.add_argument('--lambda-intent-token', type=float, default=None, help='future interaction-token loss weight')
+parser.add_argument('--model-pth', type=str, default=None, help='Stage-1 checkpoint used for Stage-2 fine-tuning')
 
 args = parser.parse_args()
 
@@ -122,14 +128,22 @@ def train_step(harper_motion_input, harper_motion_target, model, optimizer, nb_i
     in_features = human_joint * 3
     b, seqlen, _ = harper_motion_input.shape
 
-    harper_motion_input_ = harper_motion_input.clone()
-    src1, src2 = harper_motion_input_[:, :, :in_features], harper_motion_input_[:, :, in_features:]
-    src1 = torch.matmul(dct_m[:, :, :config.motion.harper_input_length], src1.cuda())
-    src2 = torch.matmul(dct_m[:, :, :config.motion.harper_input_length], src2.cuda())
+    history = harper_motion_input.cuda(non_blocking=True)
+    future = harper_motion_target.cuda(non_blocking=True)
+    history_h, history_r = history[:, :, :in_features], history[:, :, in_features:]
+    future_h, future_r = future[:, :, :in_features], future[:, :, in_features:]
+    src1 = torch.matmul(dct_m[:, :, :config.motion.harper_input_length], history_h)
+    src2 = torch.matmul(dct_m[:, :, :config.motion.harper_input_length], history_r)
 
-
-    motion_pred1, alpha_s, alpha_t, beta_s, beta_t = model(src1, src2,
-                                                           )
+    motion_pred1, alpha_s, alpha_t, beta_s, beta_t = model(
+        src1,
+        src2,
+        history_motion1=history_h,
+        history_motion2=history_r,
+        future_motion1=future_h,
+        future_motion2=future_r,
+    )
+    motion_pred2 = model.last_pred_partner
     reg_terms = [
         torch.relu(-alpha_s) + torch.relu(alpha_s - 1),
         torch.relu(-alpha_t) + torch.relu(alpha_t - 1),
@@ -139,32 +153,36 @@ def train_step(harper_motion_input, harper_motion_target, model, optimizer, nb_i
     reg_loss = sum(term.mean() for term in reg_terms)
 
     motion_pred1 = torch.matmul(idct_m[:, :config.motion.harper_input_length, :], motion_pred1)
+    motion_pred2 = torch.matmul(idct_m[:, :config.motion.harper_input_length, :], motion_pred2)
 
     if config.deriv_output:
-        offset1 = harper_motion_input[:, -1:, :in_features].cuda()
+        offset1 = history_h[:, -1:, :]
+        offset2 = history_r[:, -1:, :]
         motion_pred1 = motion_pred1[:, :config.motion.harper_target_length] + offset1
+        motion_pred2 = motion_pred2[:, :config.motion.harper_target_length] + offset2
     else:
         motion_pred1 = motion_pred1[:, :config.motion.harper_target_length]
+        motion_pred2 = motion_pred2[:, :config.motion.harper_target_length]
 
     b, n, c = harper_motion_target.shape
-    motion_pred1 = motion_pred1.reshape(b, n, human_joint, 3).reshape(-1, 3)
-
-    harper_motion_target = harper_motion_target.cuda().reshape(b, n, n_joint, 3)  # .reshape(-1, 3)
-    h_gt = harper_motion_target[:, :, :human_joint].reshape(-1, 3)
-
-    loss_h = torch.mean(torch.norm(motion_pred1 - h_gt, 2, 1))
-
+    motion_pred1 = motion_pred1.reshape(b, n, human_joint, 3)
+    motion_pred2 = motion_pred2.reshape(b, n, robot_joint, 3)
+    target_joints = future.reshape(b, n, n_joint, 3)
+    motion_h_gt = target_joints[:, :, :human_joint]
+    motion_r_gt = target_joints[:, :, human_joint:]
+    loss_h = torch.mean(torch.norm(motion_pred1 - motion_h_gt, dim=-1))
+    loss_r = torch.mean(torch.norm(motion_pred2 - motion_r_gt, dim=-1))
 
     if config.use_relative_loss:
-        motion_h_gt = h_gt.reshape(b, n, human_joint, 3)
-        motion_pred1 = motion_pred1.reshape(b, n, human_joint, 3)
         dmotion_pred = gen_velocity(motion_pred1)
         dmotion_hgt = gen_velocity(motion_h_gt)
-        dlossh = torch.mean(torch.norm((dmotion_pred - dmotion_hgt).reshape(-1, 3), 2, 1))
+        dlossh = torch.mean(torch.norm(dmotion_pred - dmotion_hgt, dim=-1))
+        dmotion_pred_r = gen_velocity(motion_pred2)
+        dmotion_rgt = gen_velocity(motion_r_gt)
+        dlossr = torch.mean(torch.norm(dmotion_pred_r - dmotion_rgt, dim=-1))
         loss_h += dlossh
+        loss_r += dlossr
 
-    else:
-        loss_h = loss_h.mean()
     rec_h = model.last_recon_h.reshape(-1, 3)
     rec_r = model.last_recon_r.reshape(-1, 3)
     inp_h = src1.reshape(b, seqlen, human_joint, 3).reshape(-1, 3)
@@ -174,12 +192,40 @@ def train_step(harper_motion_input, harper_motion_target, model, optimizer, nb_i
     rec_loss = rec_loss_h + rec_loss_r
 
     reg_loss = reg_loss * d
-    pred_loss = loss_h
-    loss = args.lambda_pre * pred_loss + args.lambda_rec * rec_loss + reg_loss
+    lambda_robot = (
+        float(args.lambda_robot)
+        if args.lambda_robot is not None
+        else float(config.intent.robot_prediction_weight)
+    )
+    lambda_kl = (
+        float(args.lambda_kl)
+        if args.lambda_kl is not None
+        else float(config.intent.kl_weight)
+    )
+    lambda_intent_token = (
+        float(args.lambda_intent_token)
+        if args.lambda_intent_token is not None
+        else float(config.intent.token_prediction_weight)
+    )
+    kl_warmup = min(1.0, float(nb_iter + 1) / float(max(1, config.intent.kl_warmup_steps)))
+    kl_loss = model.last_kl_per_sample.mean()
+    intent_token_loss = model.last_intent_token_loss_per_sample.mean()
+    pred_loss = loss_h + lambda_robot * loss_r
+    loss = (
+        args.lambda_pre * pred_loss
+        + args.lambda_rec * rec_loss
+        + lambda_kl * kl_warmup * kl_loss
+        + lambda_intent_token * intent_token_loss
+        + reg_loss
+    )
 
     writer.add_scalar('Loss/loss_all', loss.detach().cpu().numpy(), nb_iter)
     writer.add_scalar('Loss/loss_h', loss_h.detach().cpu().numpy(), nb_iter)
+    writer.add_scalar('Loss/loss_robot', loss_r.detach().cpu().numpy(), nb_iter)
     writer.add_scalar('Loss/loss_rec', rec_loss.detach().cpu().numpy(), nb_iter)
+    writer.add_scalar('Loss/loss_kl', kl_loss.detach().cpu().numpy(), nb_iter)
+    writer.add_scalar('Loss/loss_intent_token', intent_token_loss.detach().cpu().numpy(), nb_iter)
+    writer.add_scalar('Loss/kl_warmup', kl_warmup, nb_iter)
     writer.add_scalar('Loss/reg_loss', reg_loss.detach().cpu().numpy(), nb_iter)
     optimizer.zero_grad()
     loss.backward()
@@ -188,7 +234,7 @@ def train_step(harper_motion_input, harper_motion_target, model, optimizer, nb_i
     optimizer, current_lr = update_lr_multistep(nb_iter, total_iter, max_lr, min_lr, optimizer)
     writer.add_scalar('LR/train', current_lr, nb_iter)
 
-    return loss.item(), optimizer, current_lr, loss_h
+    return loss.item(), optimizer, current_lr, loss_h, loss_r
 
 if __name__=="__main__":
     model = Model(config)
@@ -207,10 +253,32 @@ if __name__=="__main__":
 
     print_and_log_info(logger, json.dumps(config, indent=4, sort_keys=True))
 
-    if config.model_pth is not None:
-        state_dict = torch.load(config.model_pth)
-        model.load_state_dict(state_dict, strict=True)
-        print_and_log_info(logger, "Loading model path from {} ".format(config.model_pth))
+    checkpoint_path = args.model_pth or config.model_pth
+    if args.stage == 2 and not checkpoint_path:
+        raise RuntimeError("Stage-2 fine-tuning requires --model-pth pointing to a Stage-1 checkpoint")
+    if checkpoint_path:
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+        load_report = model.load_compatible_state_dict(state_dict)
+        critical_missing = [
+            key
+            for key in load_report["missing"]
+            if key.startswith(
+                (
+                    "interaction_encoder.",
+                    "intent_prior.",
+                    "intent_posterior.",
+                    "future_token_decoder.",
+                    "intent_film.",
+                )
+            )
+        ]
+        if args.stage == 2 and critical_missing:
+            raise RuntimeError(
+                "Stage-1 checkpoint does not contain the new intent modules. "
+                f"Rerun H-H pretraining first. Missing: {critical_missing}"
+            )
+        print_and_log_info(logger, "Loading model path from {} ".format(checkpoint_path))
+        print_and_log_info(logger, "Compatible checkpoint report: {}".format(load_report))
 
     ##### ------ training ------- #####
     nb_iter = 0
@@ -220,12 +288,17 @@ if __name__=="__main__":
     while (nb_iter + 1) < (config.cos_lr_total_iters):
 
         for (harper_motion_input, harper_motion_target) in tqdm(dataloader):
-            # B, N, 66   B,T,66
-            loss, optimizer, current_lr, loss_h = train_step(harper_motion_input, harper_motion_target,
-                                                                                model, optimizer,
-                                                                                  nb_iter,
-                                                                                  config.cos_lr_total_iters,
-                                                                                  config.cos_lr_max, config.cos_lr_min)
+            # H-R history/target: B,T,(21+23)*3
+            loss, optimizer, current_lr, loss_h, loss_r = train_step(
+                harper_motion_input,
+                harper_motion_target,
+                model,
+                optimizer,
+                nb_iter,
+                config.cos_lr_total_iters,
+                config.cos_lr_max,
+                config.cos_lr_min,
+            )
             avg_loss += loss
             avg_lr += current_lr
 
@@ -240,7 +313,7 @@ if __name__=="__main__":
 
             if (nb_iter + 1) % config.print_loss == 0:
                 print(nb_iter + 1)
-                print(f"loss {loss}, loss_h {loss_h}  regloss {loss-loss_h}")
+                print(f"loss {loss}, loss_h {loss_h}, loss_robot {loss_r}")
             if (nb_iter + 1) % config.save_every == 0:
                 print(nb_iter + 1)
                 torch.save(model.state_dict(), config.snapshot_dir + "/model" + '/model-iter-' + str(nb_iter + 1) + '.pth')

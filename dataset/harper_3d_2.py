@@ -20,7 +20,17 @@ class Harper3D(Dataset):
     This data loader is designed to provide data for forecasting, but can easily adapted as per your needs.
     """
 
-    def __init__(self, data_path: str, split: str, n_input: int, n_output: int, sample: int, action='all', subject='all') -> None:
+    def __init__(
+        self,
+        data_path: str,
+        split: str,
+        n_input: int,
+        n_output: int,
+        sample: int,
+        action='all',
+        subject='all',
+        root_center: bool = True,
+    ) -> None:
         '''
 
         :param data_path:
@@ -44,6 +54,7 @@ class Harper3D(Dataset):
         self.n_input = n_input
         self.n_output = n_output
         self.sample_rate = sample
+        self.root_center = root_center
         self.pkls_files: list[str] = glob(os.path.join(data_folder, "*.pkl"))  #
         self.all_sequences: list[dict[int, dict]] = [load_pkl(f) for f in self.pkls_files]  #
 
@@ -98,6 +109,12 @@ class Harper3D(Dataset):
         curr_data = self.all_sequences_windows[idx]  # list
         human = torch.tensor([obs["human_joints_3d"] for obs in curr_data], dtype=torch.float32)
         spot = torch.tensor([obs["spot_joints_3d"] for obs in curr_data], dtype=torch.float32)
+        if self.root_center:
+            # Match Stage-1 preprocessing: one shared scene origin preserves
+            # human-robot displacement while removing global translation.
+            origin = human[0, 0].clone()
+            human = human - origin
+            spot = spot - origin
         seq_len, _, _ = human.shape  # seq_len, 21, 3
         human = human.reshape(seq_len, -1)
         spot = spot.reshape(seq_len, -1)

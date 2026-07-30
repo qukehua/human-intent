@@ -23,6 +23,21 @@ pip install -r requirements.txt
 
 
 ##  Training
+
+Convert the paired CMU human-interaction ASF/AMC files into the Stage-1
+`person_a/person_b` NPZ format:
+
+```
+python -m dataset.cmu_interaction_converter ^
+  --input-root D:\datasets\cmu_mocap\cmu_mocap\human_interaction ^
+  --output-dir D:\datasets\cmu_mocap\cmu_mocap\human_interaction\data_aug ^
+  --target-fps 30
+```
+
+The converter performs ASF/AMC forward kinematics, converts CMU lengths and
+root translations to metres, applies anti-aliased 120 Hz to 30 Hz
+downsampling, and retains both people in the shared capture coordinate frame.
+
 You can train the model as follows:
 ```
 CUDA_VISIBLE_DEVICES=0 CUBLAS_WORKSPACE_CONFIG=:4096:8 python train.py --seed 888 --exp-name HARPER_result.txt --layer-norm-axis spatial --with-normalization

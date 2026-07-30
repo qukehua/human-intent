@@ -15,6 +15,16 @@ model:
     inter_layers: 9
     attn_heads: 8
 
+intent:
+  token_dim: 256
+  latent_dim: 128
+  kl_weight: 1.0e-3
+  kl_warmup_steps: 10000
+  token_prediction_weight: 0.1
+  partner_prediction_weight: 1.0
+  real_pair_sampling_weight: 4.0
+  freeze_human_backbone_stage2: true
+
 train:
   epochs: 100
   batch_size: 256
@@ -31,16 +41,38 @@ sequence:
   coord_dim: 3
   target_joints: 21
   input_domain: dct
+  output_domain: dct
+  supervision_domain: time
+  reconstruction_domain: dct
+  relative_output: true
 
 datasets:
   root: /data/user/qkh/datasets
+  normalization:
+    target_layout: optitrack21
+    unit: m
+    root_center: true
+    validate_scale: true
+    min_extent_m: 0.25
+    max_extent_m: 3.5
   sources:
+    - name: CMU-Human-Interaction
+      path: D:/datasets/cmu_mocap/cmu_mocap/human_interaction/data_aug
+      split: train
+      is_multi_person: true
+      format: npz
+      keys: [person_a, person_b]
+      joint_layout: optitrack21
+      unit_scale: 1.0
+
     - name: 3DPW
       path: /data/user/qkh/datasets/3DPW/data_aug
       split: train
       is_multi_person: true
       format: npz
       keys: [person_a, person_b]
+      joint_layout: smpl24
+      unit_scale: 1.0
 
     - name: amass
       path: /data/user/qkh/datasets/amass/data_aug
@@ -49,6 +81,8 @@ datasets:
       converted_to_multi_person: true
       format: npz
       keys: [person_a, person_b]
+      joint_layout: smpl24
+      unit_scale: 1.0
 
     - name: h3.6m
       path: /data/user/qkh/datasets/h3.6m/data_aug
@@ -57,12 +91,15 @@ datasets:
       converted_to_multi_person: true
       format: npz
       keys: [person_a, person_b]
+      joint_layout: h36m32
+      unit_scale: 0.001
 
     - name: MuPots-3d
       path: /data/user/qkh/datasets/MuPots-3d/data_aug
       split: train
       is_multi_person: true
       format: npz
+      enabled: false
 
 preprocess:
   script: /data/user/qkh/human_to_robot/dataset/data_prepocess.py

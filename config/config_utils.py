@@ -64,5 +64,6 @@ def build_h2h_model_config(cfg):
                 "dim2": target_joints * coord_dim,
             },
             "motion_mlp": motion_mlp,
+            "intent": cfg.get("intent", {}),
         }
     )

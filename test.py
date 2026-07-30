@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 results_keys = ['#2', '#5', "#8", '#11', '#14', "#17", "#20", "#23", "#26", "#29"]
 n_joint = 44
 human_joint = 21
+robot_joint = 23
 
 
 def get_dct_matrix(N):
@@ -32,6 +33,7 @@ def regress_pred(config, model, pbar, num_samples, action='all'):
     idct_m = torch.tensor(idct_m).float().cuda().unsqueeze(0)
     out_n = config.motion.harper_target_length_eval
     mpjpe_human = np.zeros([out_n])
+    mpjpe_robot = np.zeros([out_n])
 
     for (motion_input, motion_target) in pbar:
         motion_input = motion_input.cuda()
@@ -46,24 +48,31 @@ def regress_pred(config, model, pbar, num_samples, action='all'):
         for idx in range(num_step):
             with torch.no_grad():
                 motion_input_ = motion_input.clone()
-                src1, src2 = motion_input_[:, :, :in_features], motion_input_[:, :, in_features:]
-                src1 = torch.matmul(dct_m[:, :, :config.motion.harper_input_length], src1.cuda())
-                src2 = torch.matmul(dct_m[:, :, :config.motion.harper_input_length], src2.cuda())
+                history_h = motion_input_[:, :, :in_features]
+                history_r = motion_input_[:, :, in_features:]
+                src1 = torch.matmul(dct_m[:, :, :config.motion.harper_input_length], history_h)
+                src2 = torch.matmul(dct_m[:, :, :config.motion.harper_input_length], history_r)
 
-                motion_pred1, _, _, _, _ = model(src1, src2)
+                motion_pred1, _, _, _, _ = model(
+                    src1,
+                    src2,
+                    history_motion1=history_h,
+                    history_motion2=history_r,
+                    sample_intent=bool(config.intent.sample_at_inference),
+                )
+                motion_pred2 = model.last_pred_partner
                 motion_pred1 = torch.matmul(idct_m[:, :config.motion.harper_input_length, :], motion_pred1)[:, :step, :]
-
-                # Keep robot stream as context-only by repeating latest observed robot pose.
-                robot_context = motion_input[:, -1:, in_features:].repeat(1, step, 1)
-                output = torch.cat([motion_pred1, robot_context], dim=-1)
+                motion_pred2 = torch.matmul(idct_m[:, :config.motion.harper_input_length, :], motion_pred2)[:, :step, :]
                 if config.deriv_output:
-                    output = output + motion_input[:, -1:, :].repeat(1, step, 1)
+                    motion_pred1 = motion_pred1 + history_h[:, -1:, :]
+                    motion_pred2 = motion_pred2 + history_r[:, -1:, :]
+                output = torch.cat([motion_pred1, motion_pred2], dim=-1)
 
             output = output.reshape(-1, n_joint * 3)
             output = output.reshape(b, step, -1)
             outputs.append(output)
             motion_input = torch.cat([motion_input[:, step:], output], axis=1)
-        motion_pred = torch.cat(outputs, axis=1)[:, :out_n]  # b, 30, 66
+        motion_pred = torch.cat(outputs, axis=1)[:, :out_n]  # B,30,(21+23)*3
 
         motion_target = motion_target.detach().cpu()
         b, nt, c = motion_target.shape
@@ -71,11 +80,26 @@ def regress_pred(config, model, pbar, num_samples, action='all'):
         motion_target = motion_target.reshape(b, nt, n_joint, 3)
 
         tmp_joi = torch.sum(torch.mean(torch.norm(motion_target[:, :, :human_joint] - motion_pred[:, :, :human_joint], dim=3), dim=2), dim=0)
+        tmp_robot = torch.sum(
+            torch.mean(
+                torch.norm(
+                    motion_target[:, :, human_joint:] - motion_pred[:, :, human_joint:],
+                    dim=3,
+                ),
+                dim=2,
+            ),
+            dim=0,
+        )
         mpjpe_human += tmp_joi.cpu().data.numpy()
+        mpjpe_robot += tmp_robot.cpu().data.numpy()
     mpjpe_human = mpjpe_human / num_samples
+    mpjpe_robot = mpjpe_robot / num_samples
 
     out_print_frame = get_out_print_frame(out_n)
-    res_dic = {"mpjpe_human": mpjpe_human[out_print_frame] * 1000}
+    res_dic = {
+        "mpjpe_human": mpjpe_human[out_print_frame] * 1000,
+        "mpjpe_robot": mpjpe_robot[out_print_frame] * 1000,
+    }
 
     print(f'Error at each output frame:\n Frame number:{out_print_frame}\n {action} Error:{res_dic}')
 
@@ -115,9 +139,13 @@ if __name__ == "__main__":
     config = load_harper_config()
 
     model = AINet(config)
-    args.model_pth = r''
-    state_dict = torch.load(args.model_pth)
-    model.load_state_dict(state_dict, strict=True)
+    if not args.model_pth:
+        parser.error("--model-pth is required")
+    state_dict = torch.load(args.model_pth, map_location="cpu")
+    load_report = model.load_compatible_state_dict(state_dict)
+    if load_report["skipped_shape"] or load_report["missing"]:
+        raise RuntimeError(f"Incomplete Stage-2 checkpoint: {load_report}")
+    model.set_stage(2)
     model.eval()
     model.cuda()
     data_root = r'/data/user/qkh/datasets/HARPER/HARPER _3D panoptic/30hz'
@@ -130,7 +158,8 @@ if __name__ == "__main__":
         print(action)
         eval_config.motion.harper_target_length = eval_config.motion.harper_target_length_eval
         eval_dataset = Harper3D(data_path=data_root, split="test", n_input=eval_config.motion.harper_input_length,
-                                n_output=eval_config.motion.harper_target_length_eval, sample=1, action=[action])
+                                n_output=eval_config.motion.harper_target_length_eval, sample=1, action=[action],
+                                root_center=eval_config.normalization.root_center)
         eval_dataloader = DataLoader(eval_dataset, batch_size=128, shuffle=False, num_workers=4)
         acc_log.write(action+'\t'+str(len(eval_dataset))+'\n')
 
