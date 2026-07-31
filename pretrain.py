@@ -394,9 +394,12 @@ def main():
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True,
+            find_unused_parameters=False,
             broadcast_buffers=False,
         )
+        # Same cross-attention blocks (and related params) are reused twice in one
+        # forward; static graph avoids "marked ready twice" reducer errors.
+        model._set_static_graph()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 

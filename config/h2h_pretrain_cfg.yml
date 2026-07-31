@@ -29,7 +29,8 @@ intent:
 train:
   epochs: 100
   # Per-GPU batch size when using torchrun/DDP. Global batch = batch_size * nproc_per_node.
-  batch_size: 256
+  # On 32GB GPUs (e.g. RTX 5090) this model peaks ~19GB at batch 16; 32 often OOMs.
+  batch_size: 16
   num_workers: 4
   lr: 3.0e-4
   weight_decay: 1.0e-4

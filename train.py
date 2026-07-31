@@ -444,9 +444,11 @@ def main():
                 raw_model,
                 device_ids=[local_rank],
                 output_device=local_rank,
-                find_unused_parameters=True,
+                find_unused_parameters=False,
                 broadcast_buffers=False,
             )
+            # Same cross-attention blocks are reused twice in one forward.
+            model._set_static_graph()
 
         base_parameters = [
             parameter

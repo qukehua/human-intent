@@ -11,6 +11,7 @@ ckpt_*/
 result/
 config/log2/
 checkpoints/
+wandb/
 
 # TensorBoard
 events.out.tfevents.*
