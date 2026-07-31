@@ -99,6 +99,24 @@ python -m dataset.data_prepocess ^
 MuPoTS-3D is retained as a test-only multi-person pose benchmark and is not
 used to train the human-intent latent.
 
+MuCo-3DHP is handled separately from MuPoTS. For temporal intent pretraining,
+the converter reads the 16 continuous MPI-INF-3DHP annotation sequences,
+selects camera 0, maps the official 28 joints to the canonical 21-joint
+layout, converts millimetres to metres, resamples each sequence from its
+official 25 Hz or 50 Hz rate to 30 Hz, splits sequences into 300-frame clips,
+and pairs every clip one-to-one with a different subject in a shared scene:
+
+```
+python -m dataset.muco3dhp_converter ^
+  --input-root D:\datasets\MuPots-3d\MuPots-3d\MuCo-3DHP\MPI-INF-3DHP ^
+  --output-dir D:\datasets\MuPots-3d\MuPots-3d\MuCo-3DHP\data_aug ^
+  --clip-frames 300 --stride-frames 300 --min-frames 70 --seed 42
+```
+
+These pairs are synthetic temporal weak supervision
+(`recorded_synchronous=false`, `intent_training_eligible=true`). The official
+MuPoTS sequences remain test-only.
+
 You can train the model as follows:
 
 Stage-1 H-H pretraining:

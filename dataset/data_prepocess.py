@@ -705,6 +705,8 @@ def main() -> None:
         "h36m": _first_existing((root / "h3.6m" / "h3.6m", root / "h3.6m")),
         "mupots": _first_existing(
             (
+                root / "MuPots-3d" / "MuPots-3d" / "MultiPersonTestSet" / "MultiPersonTestSet",
+                root / "MuPots-3d" / "MultiPersonTestSet" / "MultiPersonTestSet",
                 root / "MuPots-3d" / "MuPots-3d",
                 root / "MuPots-3d",
             )

@@ -64,6 +64,41 @@ SMPL24_TO_OPTITRACK21 = np.asarray(
     dtype=np.int64,
 )
 
+# MPI-INF-3DHP 28-joint order:
+# spine3, spine4, spine2, spine, pelvis, neck, head, head_top,
+# left clavicle/shoulder/elbow/wrist/hand, right equivalents,
+# left hip/knee/ankle/foot/toe, right equivalents.
+MPI_INF_3DHP_28_JOINT_NAMES = (
+    "spine3",
+    "spine4",
+    "spine2",
+    "spine",
+    "pelvis",
+    "neck",
+    "head",
+    "head_top",
+    "left_clavicle",
+    "left_shoulder",
+    "left_elbow",
+    "left_wrist",
+    "left_hand",
+    "right_clavicle",
+    "right_shoulder",
+    "right_elbow",
+    "right_wrist",
+    "right_hand",
+    "left_hip",
+    "left_knee",
+    "left_ankle",
+    "left_foot",
+    "left_toe",
+    "right_hip",
+    "right_knee",
+    "right_ankle",
+    "right_foot",
+    "right_toe",
+)
+
 LEFT_RIGHT_PAIRS = (
     (5, 9),
     (6, 10),
@@ -89,6 +124,9 @@ def _normalise_layout_name(layout: str) -> str:
         "h36m": "h36m32",
         "h36m32": "h36m32",
         "human36m": "h36m32",
+        "mpiinf3dhp": "mpiinf3dhp28",
+        "mpiinf3dhp28": "mpiinf3dhp28",
+        "muco3dhp": "mpiinf3dhp28",
         "auto": "auto",
     }
     if name not in aliases:
@@ -119,6 +157,8 @@ def layout_is_compatible(joint_count: int, layout: str) -> bool:
         return joint_count in {22, 24}
     if name == "h36m32":
         return joint_count == 32
+    if name == "mpiinf3dhp28":
+        return joint_count == 28
     return False
 
 
@@ -151,6 +191,42 @@ def _h36m32_to_optitrack21(motion: np.ndarray) -> np.ndarray:
     return output
 
 
+def mpi_inf_3dhp_28_to_optitrack21(motion: np.ndarray) -> np.ndarray:
+    """Map the official MPI-INF-3DHP 28-joint order to HARPER-21.
+
+    As in the H36M and CMU converters, canonical shoulder tokens are placed
+    between the thorax and anatomical shoulder, while arm/forearm/hand tokens
+    use shoulder/elbow/wrist positions.
+    """
+
+    source = _as_motion(motion)
+    if source.shape[1] != len(MPI_INF_3DHP_28_JOINT_NAMES):
+        raise ValueError(f"Expected MPI-INF-3DHP [T, 28, 3], got {source.shape}")
+    output = np.empty((source.shape[0], 21, 3), dtype=np.float32)
+    output[:, 0] = source[:, 4]  # pelvis
+    output[:, 1] = source[:, 3]  # spine
+    output[:, 2] = source[:, 1]  # upper thorax / spine4
+    output[:, 3] = source[:, 5]  # neck
+    output[:, 4] = source[:, 6]  # head
+    output[:, 5] = 0.5 * (source[:, 1] + source[:, 9])
+    output[:, 6] = source[:, 9]  # left shoulder
+    output[:, 7] = source[:, 10]  # left elbow
+    output[:, 8] = source[:, 11]  # left wrist
+    output[:, 9] = 0.5 * (source[:, 1] + source[:, 14])
+    output[:, 10] = source[:, 14]  # right shoulder
+    output[:, 11] = source[:, 15]  # right elbow
+    output[:, 12] = source[:, 16]  # right wrist
+    output[:, 13] = source[:, 18]  # left hip
+    output[:, 14] = source[:, 19]  # left knee
+    output[:, 15] = source[:, 20]  # left ankle
+    output[:, 16] = source[:, 22]  # left toe
+    output[:, 17] = source[:, 23]  # right hip
+    output[:, 18] = source[:, 24]  # right knee
+    output[:, 19] = source[:, 25]  # right ankle
+    output[:, 20] = source[:, 27]  # right toe
+    return output
+
+
 def _median_body_extent(motion: np.ndarray) -> float:
     frame_min = motion.min(axis=1)
     frame_max = motion.max(axis=1)
@@ -178,6 +254,8 @@ def canonicalize_motion(
             name = "smpl24"
         elif source.shape[1] == 32:
             name = "h36m32"
+        elif source.shape[1] == 28:
+            name = "mpiinf3dhp28"
         else:
             raise ValueError(f"Cannot infer layout from {source.shape[1]} joints")
 
@@ -190,6 +268,8 @@ def canonicalize_motion(
         canonical = source[:, SMPL24_TO_OPTITRACK21].copy()
     elif name == "h36m32":
         canonical = _h36m32_to_optitrack21(source)
+    elif name == "mpiinf3dhp28":
+        canonical = mpi_inf_3dhp_28_to_optitrack21(source)
     else:
         raise AssertionError(f"Unhandled layout: {name}")
 

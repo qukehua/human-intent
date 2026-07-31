@@ -99,8 +99,19 @@ datasets:
       unit_scale: 1.0
       intent_supervision: true
 
-    - name: MuPots-3d
-      path: D:/datasets/MuPots-3d/MuPots-3d
+    - name: MuCo-3DHP-temporal
+      path: D:/datasets/MuPots-3d/MuPots-3d/MuCo-3DHP/data_aug
+      split: train
+      is_multi_person: false
+      converted_to_multi_person: true
+      format: npz
+      keys: [person_a, person_b]
+      joint_layout: optitrack21
+      unit_scale: 1.0
+      intent_supervision: true
+
+    - name: MuPoTS-3D
+      path: D:/datasets/MuPots-3d/MuPots-3d/MultiPersonTestSet/MultiPersonTestSet
       split: test
       is_multi_person: true
       format: npz
@@ -122,3 +133,13 @@ preprocess:
     min_pair_distance_m: 0.8
     max_pair_distance_m: 2.0
     intent_supervision: true
+  muco3dhp_temporal:
+    script: D:/code/hrc/code/Human_to_Robot/dataset/muco3dhp_converter.py
+    source_fps: official_per_sequence_25_or_50
+    target_fps: 30
+    camera: 0
+    annotation_stream: univ_annot3
+    clip_frames: 300
+    stride_frames: 300
+    min_frames: 70
+    require_different_subjects: true
