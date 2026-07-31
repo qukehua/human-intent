@@ -7,9 +7,9 @@
 
 ##  Environment
 The project is developed under the following environment:
-- Python 3.10 
-- PyTorch 2.1
-- CUDA 12.1
+- Python 3.10
+- PyTorch >= 2.7 (CUDA 12.8+ / 13.0 recommended for RTX 5090 / `sm_120`)
+- wandb >= 0.22.3 (required for modern `wandb_v1_` API keys)
 
 
 
@@ -17,9 +17,12 @@ The project is developed under the following environment:
 For installation of the project dependencies, please run:
 ```
 conda create -n human_to_robot python=3.10
-conda install -y pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=12.1 -c pytorch -c nvidia
+conda activate human_to_robot
+# Blackwell GPUs (RTX 5090): install a CUDA 12.8+ / 13.0 torch build with sm_120
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
-``` 
+wandb login
+```
 
 
 ##  Training
@@ -119,11 +122,20 @@ MuPoTS sequences remain test-only.
 
 You can train the model as follows:
 
-Stage-1 H-H pretraining:
+Stage-1 H-H pretraining (single GPU):
 
 ```
 python pretrain.py --cfg config/h2h_pretrain_cfg.yml ^
   --work-dir ckpt_h2h_pretrain
+```
+
+Stage-1 H-H pretraining with 8-GPU DDP (`batch_size` in the YAML is **per GPU**):
+
+```
+torchrun --standalone --nproc_per_node=8 pretrain.py ^
+  --cfg config/h2h_pretrain_cfg.yml ^
+  --work-dir ckpt_h2h_pretrain ^
+  --wandb --wandb-project human-intent
 ```
 
 Enable Weights & Biases logging with `--wandb` (or set `wandb.enable: true` in the
@@ -142,6 +154,16 @@ python train.py --stage 2 ^
   --model-pth ckpt_h2h_pretrain/pretrain_stage1_final.pth ^
   --seed 888 --exp-name HARPER_result.txt ^
   --layer-norm-axis spatial --with-normalization
+```
+
+Stage-2 with 8-GPU DDP:
+
+```
+torchrun --standalone --nproc_per_node=8 train.py --stage 2 ^
+  --model-pth ckpt_h2h_pretrain/pretrain_stage1_final.pth ^
+  --seed 888 --exp-name HARPER_result.txt ^
+  --layer-norm-axis spatial --with-normalization ^
+  --wandb --wandb-project human-intent
 ```
 
 ```

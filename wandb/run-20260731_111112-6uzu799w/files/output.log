@@ -1,0 +1,27 @@
+/root/miniforge/envs/human_to_robot/lib/python3.10/site-packages/torch/cuda/__init__.py:215: UserWarning:
+NVIDIA GeForce RTX 5090 with CUDA capability sm_120 is not compatible with the current PyTorch installation.
+The current PyTorch install supports CUDA capabilities sm_50 sm_60 sm_70 sm_75 sm_80 sm_86 sm_90.
+If you want to use the NVIDIA GeForce RTX 5090 GPU with PyTorch, please check the instructions at https://pytorch.org/get-started/locally/
+
+  warnings.warn(
+Traceback (most recent call last):
+  File "/root/workspace/human-intent/pretrain.py", line 478, in <module>
+    main()
+  File "/root/workspace/human-intent/pretrain.py", line 349, in main
+    model = AINet(config).cuda()
+  File "/root/miniforge/envs/human_to_robot/lib/python3.10/site-packages/torch/nn/modules/module.py", line 918, in cuda
+    return self._apply(lambda t: t.cuda(device))
+  File "/root/miniforge/envs/human_to_robot/lib/python3.10/site-packages/torch/nn/modules/module.py", line 810, in _apply
+    module._apply(fn)
+  File "/root/miniforge/envs/human_to_robot/lib/python3.10/site-packages/torch/nn/modules/module.py", line 810, in _apply
+    module._apply(fn)
+  File "/root/miniforge/envs/human_to_robot/lib/python3.10/site-packages/torch/nn/modules/rnn.py", line 218, in _apply
+    self._init_flat_weights()
+  File "/root/miniforge/envs/human_to_robot/lib/python3.10/site-packages/torch/nn/modules/rnn.py", line 155, in _init_flat_weights
+    self.flatten_parameters()
+  File "/root/miniforge/envs/human_to_robot/lib/python3.10/site-packages/torch/nn/modules/rnn.py", line 206, in flatten_parameters
+    torch._cudnn_rnn_flatten_weight(
+RuntimeError: CUDA error: no kernel image is available for execution on the device
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1.
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.

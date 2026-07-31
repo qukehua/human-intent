@@ -28,6 +28,7 @@ intent:
 
 train:
   epochs: 100
+  # Per-GPU batch size when using torchrun/DDP. Global batch = batch_size * nproc_per_node.
   batch_size: 256
   num_workers: 4
   lr: 3.0e-4

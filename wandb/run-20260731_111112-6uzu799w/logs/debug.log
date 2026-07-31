@@ -1,0 +1,42 @@
+2026-07-31 11:11:12,181 INFO    MainThread:81121 [wandb_setup.py:_flush():81] Current SDK version is 0.28.1
+2026-07-31 11:11:12,182 INFO    MainThread:81121 [wandb_setup.py:_flush():81] Configure stats pid to 81121
+2026-07-31 11:11:12,182 INFO    MainThread:81121 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-07-31 11:11:12,182 INFO    MainThread:81121 [wandb_init.py:setup_run_log_directory():729] Logging user logs to /root/workspace/human-intent/wandb/run-20260731_111112-6uzu799w/logs/debug.log
+2026-07-31 11:11:12,182 INFO    MainThread:81121 [wandb_init.py:setup_run_log_directory():730] Logging internal logs to /root/workspace/human-intent/wandb/run-20260731_111112-6uzu799w/logs/debug-internal.log
+2026-07-31 11:11:12,182 INFO    MainThread:81121 [wandb_init.py:init():772] calling init triggers
+2026-07-31 11:11:12,182 INFO    MainThread:81121 [wandb_init.py:init():777] wandb.init called with sweep_config: {}
+config: {'stage': 1, 'seed': 42, 'work_dir': 'ckpt_h2h_pretrain', 'cfg': 'config/h2h_pretrain_cfg.yml', 'train': {'epochs': 100, 'batch_size': 256, 'num_workers': 4, 'lr': 0.0003, 'weight_decay': 0.0001, 'lambda_pre': 1.0, 'lambda_rec': 0.5, 'save_every': 20}, 'intent': {'token_dim': 256, 'latent_dim': 128, 'kl_weight': 0.001, 'kl_warmup_steps': 10000, 'token_prediction_weight': 0.1, 'partner_prediction_weight': 1.0, 'balance_sources': True, 'real_pair_sampling_weight': 4.0, 'freeze_human_backbone_stage2': True}, 'sequence': {'obs_len': 60, 'pred_len': 10, 'coord_dim': 3, 'target_joints': 21, 'input_domain': 'dct', 'output_domain': 'dct', 'supervision_domain': 'time', 'reconstruction_domain': 'dct', 'relative_output': True}, 'model': {'file': 'network/model.py', 'class_name': 'AINet', 'freeze_cross_attn': False, 'use_ifb': False, 'motion_mlp': {'hidden_dim': 512, 'embed_dim': 512, 'dropout': 0.1, 'intra_layers': 12, 'inter_layers': 9, 'attn_heads': 8}}, 'dataset_windows': 2069802, 'intent_pair_count': 2069802, 'recorded_pair_count': 12072, 'synthetic_pair_count': 2057730, 'source_window_counts': {'CMU-Human-Interaction': 5050, '3DPW': 7022, 'amass': 1735650, 'h3.6m': 231018, 'MuCo-3DHP-temporal': 91062}, 'source_sampling_share': {'CMU-Human-Interaction': 0.36363636363636387, '3DPW': 0.3636363636363292, 'amass': 0.09090909091198221, 'h3.6m': 0.09090909090886529, 'MuCo-3DHP-temporal': 0.09090909090897753}, '_wandb': {}}
+2026-07-31 11:11:12,182 INFO    MainThread:81121 [wandb_init.py:init():820] starting backend
+2026-07-31 11:11:12,182 INFO    MainThread:81121 [wandb_init.py:init():835] sending inform_init request
+2026-07-31 11:11:12,393 INFO    MainThread:81121 [wandb_init.py:init():840] backend started and connected
+2026-07-31 11:11:12,394 INFO    MainThread:81121 [wandb_init.py:init():910] updated telemetry
+2026-07-31 11:11:12,400 INFO    MainThread:81121 [wandb_init.py:init():933] communicating run to backend with 90.0 second timeout
+2026-07-31 11:11:14,265 INFO    MainThread:81121 [wandb_init.py:init():978] starting run threads in backend
+2026-07-31 11:11:14,327 INFO    MainThread:81121 [wandb_run.py:_console_start():2621] atexit reg
+2026-07-31 11:11:14,327 INFO    MainThread:81121 [wandb_run.py:_redirect():2471] redirect: wrap_raw
+2026-07-31 11:11:14,327 INFO    MainThread:81121 [wandb_run.py:_redirect():2540] Wrapping output streams.
+2026-07-31 11:11:14,327 INFO    MainThread:81121 [wandb_run.py:_redirect():2563] Redirects installed.
+2026-07-31 11:11:14,328 INFO    MainThread:81121 [wandb_init.py:init():1016] run started, returning control to user process
+2026-07-31 11:11:15,293 INFO    wandb-AsyncioManager-main:81121 [service_client.py:_forward_responses():122] [no run ID] Reached EOF.
+2026-07-31 11:11:15,293 INFO    wandb-AsyncioManager-main:81121 [mailbox.py:close():154] [no run ID] Closing mailbox, abandoning 2 handles.
+2026-07-31 11:11:15,293 ERROR   wandb-AsyncioManager-main:81121 [asyncio_manager.py:fn_wrap_exceptions():197] Uncaught exception in run_soon callback.
+Traceback (most recent call last):
+  File "/root/miniforge/envs/human_to_robot/lib/python3.10/site-packages/wandb/sdk/lib/asyncio_manager.py", line 195, in fn_wrap_exceptions
+    await fn()
+  File "/root/miniforge/envs/human_to_robot/lib/python3.10/site-packages/wandb/sdk/lib/run_messages.py", line 90, in loop
+    await asyncio_compat.race(
+  File "/root/miniforge/envs/human_to_robot/lib/python3.10/site-packages/wandb/sdk/lib/asyncio_compat.py", line 279, in race
+    async with open_task_group(race=True) as tg:
+  File "/root/miniforge/envs/human_to_robot/lib/python3.10/contextlib.py", line 206, in __aexit__
+    await anext(self.gen)
+  File "/root/miniforge/envs/human_to_robot/lib/python3.10/site-packages/wandb/sdk/lib/asyncio_compat.py", line 241, in open_task_group
+    await task_group._wait_all(race=race, timeout=exit_timeout)
+  File "/root/miniforge/envs/human_to_robot/lib/python3.10/site-packages/wandb/sdk/lib/asyncio_compat.py", line 181, in _wait_all
+    raise exc
+  File "/root/miniforge/envs/human_to_robot/lib/python3.10/site-packages/wandb/sdk/lib/run_messages.py", line 113, in _print_all
+    result = await handle.wait_async(timeout=None)
+  File "/root/miniforge/envs/human_to_robot/lib/python3.10/site-packages/wandb/sdk/mailbox/mailbox_handle.py", line 127, in wait_async
+    response = await self._handle.wait_async(timeout=timeout)
+  File "/root/miniforge/envs/human_to_robot/lib/python3.10/site-packages/wandb/sdk/mailbox/response_handle.py", line 123, in wait_async
+    raise HandleAbandonedError()
+wandb.sdk.mailbox.mailbox_handle.HandleAbandonedError

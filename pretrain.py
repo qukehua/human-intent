@@ -1,15 +1,26 @@
 import argparse
+import math
 import warnings
 from pathlib import Path
 
 import numpy as np
 import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 
 from config.config_utils import build_h2h_model_config, load_yaml
 from dataset.skeleton_utils import canonicalize_motion, scene_center_pair
 from network.model import AINet
+from utils.distributed import (
+    barrier,
+    cleanup_distributed,
+    init_distributed,
+    is_main_process,
+    print0,
+    seed_everything,
+    unwrap_model,
+)
 from utils.wandb_utils import (
     add_wandb_args,
     finish_wandb,
@@ -228,18 +239,28 @@ def parse_args():
     parser.add_argument("--work-dir", type=str, default="./ckpt_h2h_pretrain")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=0, help="0 means full training by epochs")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Per-GPU batch size (overrides config). Global batch = batch_size * world_size",
+    )
     add_wandb_args(parser)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    distributed, rank, local_rank, world_size = init_distributed()
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
     cfg = load_yaml(args.cfg)
 
     seed = int(args.seed if args.seed is not None else cfg.get("seed", 888))
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    Path(args.work_dir).mkdir(parents=True, exist_ok=True)
+    seed_everything(seed, rank=rank)
+    if is_main_process():
+        Path(args.work_dir).mkdir(parents=True, exist_ok=True)
+    barrier()
 
     obs_len = int(cfg["sequence"]["obs_len"])
     pred_len = int(cfg["sequence"]["pred_len"])
@@ -257,7 +278,7 @@ def main():
     expected_domains = {"input": "dct", "output": "dct", "supervision": "time", "reconstruction": "dct"}
     if domains != expected_domains:
         raise ValueError(f"Unsupported domain configuration {domains}; expected {expected_domains}")
-    batch_size = int(cfg["train"]["batch_size"])
+    batch_size = int(args.batch_size if args.batch_size is not None else cfg["train"]["batch_size"])
     epochs = int(cfg["train"]["epochs"])
     num_workers = int(cfg["train"]["num_workers"])
     lr = float(cfg["train"]["lr"])
@@ -294,27 +315,40 @@ def main():
         sample_weight_values.append(weight)
         source_sampling_mass[source_name] += weight
     sample_weights = torch.tensor(sample_weight_values, dtype=torch.double)
-    sampler = WeightedRandomSampler(sample_weights, num_samples=len(dataset), replacement=True)
+    # With DDP + replacement sampling, each rank draws its own weighted subset so
+    # every GPU stays busy while preserving source/real-pair sampling ratios.
+    samples_per_rank = int(math.ceil(len(dataset) / float(world_size)))
+    sampler = WeightedRandomSampler(
+        sample_weights,
+        num_samples=samples_per_rank,
+        replacement=True,
+        generator=torch.Generator().manual_seed(seed + rank),
+    )
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         sampler=sampler,
         num_workers=num_workers,
         drop_last=True,
+        pin_memory=torch.cuda.is_available(),
     )
-    print(
+    print0(
         f"H2H windows: {len(dataset)} total, {intent_pair_count} intent-enabled "
         f"({intent_pair_count / len(dataset):.1%}), {recorded_pair_count} recorded synchronous, "
         f"{synthetic_pair_count} synthetic; source balancing={balance_sources}, "
         f"recorded-pair sampling weight={real_pair_sampling_weight:g}"
     )
+    print0(
+        f"DDP: world_size={world_size}, per-GPU batch={batch_size}, "
+        f"global batch={batch_size * world_size}, samples/rank/epoch={samples_per_rank}"
+    )
     total_sampling_mass = float(sample_weights.sum())
-    print("H2H windows and expected sampling share by source:")
+    print0("H2H windows and expected sampling share by source:")
     source_share = {}
     for name, count in dataset.source_window_counts.items():
         share = source_sampling_mass[name] / total_sampling_mass
         source_share[name] = share
-        print(f"  {name}: {count} windows, {share:.1%} sampled")
+        print0(f"  {name}: {count} windows, {share:.1%} sampled")
 
     wandb_settings = resolve_wandb_settings(
         cfg,
@@ -325,6 +359,9 @@ def main():
         mode=args.wandb_mode,
         log_every=args.wandb_log_every,
     )
+    if not is_main_process():
+        wandb_settings = dict(wandb_settings)
+        wandb_settings["enable"] = False
     wandb_config = {
         "stage": int(cfg.get("stage", 1)),
         "seed": seed,
@@ -340,30 +377,44 @@ def main():
         "synthetic_pair_count": synthetic_pair_count,
         "source_window_counts": dict(dataset.source_window_counts),
         "source_sampling_share": source_share,
+        "world_size": world_size,
+        "per_gpu_batch_size": batch_size,
+        "global_batch_size": batch_size * world_size,
     }
     init_wandb(wandb_settings, config=wandb_config, job_type="pretrain")
     wandb_log_every = int(wandb_settings["log_every"])
 
     config = build_h2h_model_config(cfg)
 
-    model = AINet(config).cuda()
+    model = AINet(config).to(device)
     model.set_stage(int(cfg.get("stage", 1)))
     model.train()
+    if distributed:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+            broadcast_buffers=False,
+        )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     dct_m, idct_m = get_dct_matrix(obs_len)
-    dct_m = torch.tensor(dct_m).float().cuda().unsqueeze(0)
-    idct_m = torch.tensor(idct_m).float().cuda().unsqueeze(0)
+    dct_m = torch.tensor(dct_m).float().to(device).unsqueeze(0)
+    idct_m = torch.tensor(idct_m).float().to(device).unsqueeze(0)
 
     step = 0
     try:
         for ep in range(epochs):
-            pbar = tqdm(loader, desc=f"pretrain epoch {ep+1}/{epochs}")
-            for motion_input, motion_target, intent_valid in pbar:
-                motion_input = motion_input.cuda()  # [B,T,126]
-                motion_target = motion_target.cuda()  # [B,P,126]
-                intent_valid = intent_valid.cuda()
+            raw_model = unwrap_model(model)
+            iterator = loader
+            if is_main_process():
+                iterator = tqdm(loader, desc=f"pretrain epoch {ep+1}/{epochs}")
+            for motion_input, motion_target, intent_valid in iterator:
+                motion_input = motion_input.to(device, non_blocking=True)
+                motion_target = motion_target.to(device, non_blocking=True)
+                intent_valid = intent_valid.to(device, non_blocking=True)
                 b, t, _ = motion_input.shape
                 in_features = target_joints * coord_dim
 
@@ -383,7 +434,7 @@ def main():
                     future_motion2=tgt2,
                     interaction_valid=intent_valid,
                 )
-                pred2_dct = model.last_pred_partner
+                pred2_dct = raw_model.last_pred_partner
                 # The model predicts DCT coefficients. Convert them back to time
                 # before comparing with the time-domain future target.
                 pred1_time = torch.matmul(idct_m, pred1_dct)[:, :pred_len]
@@ -400,8 +451,8 @@ def main():
                 loss_person2 = torch.mean(torch.norm(pred2_xyz - tgt2_xyz, dim=-1))
                 loss_pre = loss_person1 + lambda_partner * loss_person2
 
-                rec1 = model.last_recon_h
-                rec2 = model.last_recon_r
+                rec1 = raw_model.last_recon_h
+                rec2 = raw_model.last_recon_r
                 # Reconstruction heads also operate in the DCT domain.
                 src1_xyz = src1_dct.reshape(b, t, target_joints, coord_dim).reshape(-1, coord_dim)
                 src2_xyz = src2_dct.reshape(b, t, target_joints, coord_dim).reshape(-1, coord_dim)
@@ -412,9 +463,9 @@ def main():
                 )
 
                 kl_warmup = min(1.0, float(step + 1) / float(kl_warmup_steps))
-                loss_kl = masked_mean(model.last_kl_per_sample, intent_valid)
+                loss_kl = masked_mean(raw_model.last_kl_per_sample, intent_valid)
                 loss_intent_token = masked_mean(
-                    model.last_intent_token_loss_per_sample,
+                    raw_model.last_intent_token_loss_per_sample,
                     intent_valid,
                 )
                 total = (
@@ -423,23 +474,24 @@ def main():
                     + lambda_kl * kl_warmup * loss_kl
                     + lambda_intent_token * loss_intent_token
                 )
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 total.backward()
                 optimizer.step()
 
                 step += 1
-                pbar.set_postfix(
-                    {
-                        "loss": f"{total.item():.4f}",
-                        "p1": f"{loss_person1.item():.4f}",
-                        "p2": f"{loss_person2.item():.4f}",
-                        "rec": f"{loss_rec.item():.4f}",
-                        "kl": f"{loss_kl.item():.4f}",
-                        "intent": f"{loss_intent_token.item():.4f}",
-                        "intent_valid": f"{intent_valid.mean().item():.2f}",
-                    }
-                )
-                if should_log(step, wandb_log_every):
+                if is_main_process() and hasattr(iterator, "set_postfix"):
+                    iterator.set_postfix(
+                        {
+                            "loss": f"{total.item():.4f}",
+                            "p1": f"{loss_person1.item():.4f}",
+                            "p2": f"{loss_person2.item():.4f}",
+                            "rec": f"{loss_rec.item():.4f}",
+                            "kl": f"{loss_kl.item():.4f}",
+                            "intent": f"{loss_intent_token.item():.4f}",
+                            "intent_valid": f"{intent_valid.mean().item():.2f}",
+                        }
+                    )
+                if is_main_process() and should_log(step, wandb_log_every):
                     wandb_log(
                         {
                             "train/loss": total.item(),
@@ -453,6 +505,7 @@ def main():
                             "train/intent_valid_frac": intent_valid.mean().item(),
                             "train/epoch": ep + 1,
                             "train/lr": lr,
+                            "train/world_size": world_size,
                         },
                         step=step,
                     )
@@ -460,18 +513,24 @@ def main():
                 if args.max_steps > 0 and step >= args.max_steps:
                     break
 
-            ckpt = Path(args.work_dir) / f"pretrain_stage1_epoch{ep+1}.pth"
-            torch.save(model.state_dict(), ckpt)
-            wandb_log({"checkpoint/epoch": ep + 1}, step=step)
+            barrier()
+            if is_main_process():
+                ckpt = Path(args.work_dir) / f"pretrain_stage1_epoch{ep+1}.pth"
+                torch.save(unwrap_model(model).state_dict(), ckpt)
+                wandb_log({"checkpoint/epoch": ep + 1}, step=step)
             if args.max_steps > 0 and step >= args.max_steps:
                 break
 
-        final_ckpt = Path(args.work_dir) / "pretrain_stage1_final.pth"
-        torch.save(model.state_dict(), final_ckpt)
-        print(f"saved: {final_ckpt}")
-        print(f"total steps: {step}")
+        barrier()
+        if is_main_process():
+            final_ckpt = Path(args.work_dir) / "pretrain_stage1_final.pth"
+            torch.save(unwrap_model(model).state_dict(), final_ckpt)
+            print(f"saved: {final_ckpt}")
+            print(f"total steps: {step}")
     finally:
-        finish_wandb()
+        if is_main_process():
+            finish_wandb()
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
