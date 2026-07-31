@@ -57,7 +57,7 @@ sequence:
   relative_output: true
 
 datasets:
-  root: /data/user/qkh/datasets
+  root: /root/workspace/datasets
   normalization:
     target_layout: optitrack21
     unit: m
@@ -67,7 +67,7 @@ datasets:
     max_extent_m: 3.5
   sources:
     - name: CMU-Human-Interaction
-      path: D:/datasets/cmu_mocap/cmu_mocap/human_interaction/data_aug
+      path: /root/workspace/datasets/cmu/human_interaction
       split: train
       is_multi_person: true
       format: npz
@@ -77,7 +77,7 @@ datasets:
       intent_supervision: true
 
     - name: 3DPW
-      path: D:/datasets/3DPW/3DPW/data_aug
+      path: /root/workspace/datasets/3dpw
       split: train
       is_multi_person: true
       format: npz
@@ -87,7 +87,7 @@ datasets:
       intent_supervision: true
 
     - name: amass
-      path: D:/datasets/amass/amass/data_aug
+      path: /root/workspace/datasets/Amass
       split: train
       is_multi_person: false
       converted_to_multi_person: true
@@ -98,7 +98,7 @@ datasets:
       intent_supervision: true
 
     - name: h3.6m
-      path: D:/datasets/h3.6m/h3.6m/data_aug
+      path: /root/workspace/datasets/h3.6m
       split: train
       is_multi_person: false
       converted_to_multi_person: true
@@ -109,7 +109,7 @@ datasets:
       intent_supervision: true
 
     - name: MuCo-3DHP-temporal
-      path: D:/datasets/MuPots-3d/MuPots-3d/MuCo-3DHP/data_aug
+      path: /root/workspace/datasets/MuPots-3d/MuCo-3DHP
       split: train
       is_multi_person: false
       converted_to_multi_person: true
@@ -120,7 +120,7 @@ datasets:
       intent_supervision: true
 
     - name: MuPoTS-3D
-      path: D:/datasets/MuPots-3d/MuPots-3d/MultiPersonTestSet/MultiPersonTestSet
+      path: /root/workspace/datasets/MuPots-3d/MultiPersonTestSet/MultiPersonTestSet
       split: test
       is_multi_person: true
       format: npz
@@ -129,11 +129,11 @@ datasets:
       reason: multi-person 3-D pose test benchmark; excluded to prevent test leakage
 
 preprocess:
-  script: D:/code/hrc/code/Human_to_Robot/dataset/data_prepocess.py
+  script: /root/workspace/human-intent/dataset/data_prepocess.py
   out_folder_name: data_aug
   max_files_per_dataset: 0
   target_fps: 30
-  smplh_model_dir: D:/datasets/amass/body_models
+  smplh_model_dir: /root/workspace/datasets/amass/body_models
   smplh_joint_backend: numpy
   augment_single_person:
     enable: true
@@ -143,7 +143,7 @@ preprocess:
     max_pair_distance_m: 2.0
     intent_supervision: true
   muco3dhp_temporal:
-    script: D:/code/hrc/code/Human_to_Robot/dataset/muco3dhp_converter.py
+    script: /root/workspace/human-intent/dataset/muco3dhp_converter.py
     source_fps: official_per_sequence_25_or_50
     target_fps: 30
     camera: 0
