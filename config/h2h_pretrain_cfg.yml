@@ -36,6 +36,15 @@ train:
   lambda_rec: 0.5
   save_every: 20
 
+wandb:
+  enable: false
+  project: human-intent
+  entity: null
+  run_name: null
+  mode: online
+  log_every: 10
+  tags: [h2h-pretrain]
+
 sequence:
   obs_len: 60
   pred_len: 10

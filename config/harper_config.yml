@@ -63,3 +63,12 @@ model_pth:
 shift_step: 1
 print_every: 1000
 save_every: 1000
+
+wandb:
+  enable: false
+  project: human-intent
+  entity: null
+  run_name: null
+  mode: online
+  log_every: 10
+  tags: [harper-finetune]

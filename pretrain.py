@@ -10,6 +10,14 @@ from tqdm import tqdm
 from config.config_utils import build_h2h_model_config, load_yaml
 from dataset.skeleton_utils import canonicalize_motion, scene_center_pair
 from network.model import AINet
+from utils.wandb_utils import (
+    add_wandb_args,
+    finish_wandb,
+    init_wandb,
+    resolve_wandb_settings,
+    should_log,
+    wandb_log,
+)
 
 
 def get_dct_matrix(n: int):
@@ -220,6 +228,7 @@ def parse_args():
     parser.add_argument("--work-dir", type=str, default="./ckpt_h2h_pretrain")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=0, help="0 means full training by epochs")
+    add_wandb_args(parser)
     return parser.parse_args()
 
 
@@ -301,9 +310,39 @@ def main():
     )
     total_sampling_mass = float(sample_weights.sum())
     print("H2H windows and expected sampling share by source:")
+    source_share = {}
     for name, count in dataset.source_window_counts.items():
         share = source_sampling_mass[name] / total_sampling_mass
+        source_share[name] = share
         print(f"  {name}: {count} windows, {share:.1%} sampled")
+
+    wandb_settings = resolve_wandb_settings(
+        cfg,
+        enable=args.wandb_enable,
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        run_name=args.wandb_run_name,
+        mode=args.wandb_mode,
+        log_every=args.wandb_log_every,
+    )
+    wandb_config = {
+        "stage": int(cfg.get("stage", 1)),
+        "seed": seed,
+        "work_dir": str(args.work_dir),
+        "cfg": args.cfg,
+        "train": cfg.get("train", {}),
+        "intent": intent_cfg,
+        "sequence": cfg.get("sequence", {}),
+        "model": cfg.get("model", {}),
+        "dataset_windows": len(dataset),
+        "intent_pair_count": intent_pair_count,
+        "recorded_pair_count": recorded_pair_count,
+        "synthetic_pair_count": synthetic_pair_count,
+        "source_window_counts": dict(dataset.source_window_counts),
+        "source_sampling_share": source_share,
+    }
+    init_wandb(wandb_settings, config=wandb_config, job_type="pretrain")
+    wandb_log_every = int(wandb_settings["log_every"])
 
     config = build_h2h_model_config(cfg)
 
@@ -318,100 +357,121 @@ def main():
     idct_m = torch.tensor(idct_m).float().cuda().unsqueeze(0)
 
     step = 0
-    for ep in range(epochs):
-        pbar = tqdm(loader, desc=f"pretrain epoch {ep+1}/{epochs}")
-        for motion_input, motion_target, intent_valid in pbar:
-            motion_input = motion_input.cuda()  # [B,T,126]
-            motion_target = motion_target.cuda()  # [B,P,126]
-            intent_valid = intent_valid.cuda()
-            b, t, _ = motion_input.shape
-            in_features = target_joints * coord_dim
+    try:
+        for ep in range(epochs):
+            pbar = tqdm(loader, desc=f"pretrain epoch {ep+1}/{epochs}")
+            for motion_input, motion_target, intent_valid in pbar:
+                motion_input = motion_input.cuda()  # [B,T,126]
+                motion_target = motion_target.cuda()  # [B,P,126]
+                intent_valid = intent_valid.cuda()
+                b, t, _ = motion_input.shape
+                in_features = target_joints * coord_dim
 
-            src1 = motion_input[:, :, :in_features]
-            src2 = motion_input[:, :, in_features:]
-            tgt1 = motion_target[:, :, :in_features]
-            tgt2 = motion_target[:, :, in_features:]
-            src1_dct = torch.matmul(dct_m[:, :, :obs_len], src1)
-            src2_dct = torch.matmul(dct_m[:, :, :obs_len], src2)
+                src1 = motion_input[:, :, :in_features]
+                src2 = motion_input[:, :, in_features:]
+                tgt1 = motion_target[:, :, :in_features]
+                tgt2 = motion_target[:, :, in_features:]
+                src1_dct = torch.matmul(dct_m[:, :, :obs_len], src1)
+                src2_dct = torch.matmul(dct_m[:, :, :obs_len], src2)
 
-            pred1_dct, _, _, _, _ = model(
-                src1_dct,
-                src2_dct,
-                history_motion1=src1,
-                history_motion2=src2,
-                future_motion1=tgt1,
-                future_motion2=tgt2,
-                interaction_valid=intent_valid,
-            )
-            pred2_dct = model.last_pred_partner
-            # The model predicts DCT coefficients. Convert them back to time
-            # before comparing with the time-domain future target.
-            pred1_time = torch.matmul(idct_m, pred1_dct)[:, :pred_len]
-            pred2_time = torch.matmul(idct_m, pred2_dct)[:, :pred_len]
-            if relative_output:
-                pred1_time = pred1_time + src1[:, -1:, :]
-                pred2_time = pred2_time + src2[:, -1:, :]
+                pred1_dct, _, _, _, _ = model(
+                    src1_dct,
+                    src2_dct,
+                    history_motion1=src1,
+                    history_motion2=src2,
+                    future_motion1=tgt1,
+                    future_motion2=tgt2,
+                    interaction_valid=intent_valid,
+                )
+                pred2_dct = model.last_pred_partner
+                # The model predicts DCT coefficients. Convert them back to time
+                # before comparing with the time-domain future target.
+                pred1_time = torch.matmul(idct_m, pred1_dct)[:, :pred_len]
+                pred2_time = torch.matmul(idct_m, pred2_dct)[:, :pred_len]
+                if relative_output:
+                    pred1_time = pred1_time + src1[:, -1:, :]
+                    pred2_time = pred2_time + src2[:, -1:, :]
 
-            pred1_xyz = pred1_time.reshape(b, pred_len, target_joints, coord_dim)
-            pred2_xyz = pred2_time.reshape(b, pred_len, target_joints, coord_dim)
-            tgt1_xyz = tgt1.reshape(b, pred_len, target_joints, coord_dim)
-            tgt2_xyz = tgt2.reshape(b, pred_len, target_joints, coord_dim)
-            loss_person1 = torch.mean(torch.norm(pred1_xyz - tgt1_xyz, dim=-1))
-            loss_person2 = torch.mean(torch.norm(pred2_xyz - tgt2_xyz, dim=-1))
-            loss_pre = loss_person1 + lambda_partner * loss_person2
+                pred1_xyz = pred1_time.reshape(b, pred_len, target_joints, coord_dim)
+                pred2_xyz = pred2_time.reshape(b, pred_len, target_joints, coord_dim)
+                tgt1_xyz = tgt1.reshape(b, pred_len, target_joints, coord_dim)
+                tgt2_xyz = tgt2.reshape(b, pred_len, target_joints, coord_dim)
+                loss_person1 = torch.mean(torch.norm(pred1_xyz - tgt1_xyz, dim=-1))
+                loss_person2 = torch.mean(torch.norm(pred2_xyz - tgt2_xyz, dim=-1))
+                loss_pre = loss_person1 + lambda_partner * loss_person2
 
-            rec1 = model.last_recon_h
-            rec2 = model.last_recon_r
-            # Reconstruction heads also operate in the DCT domain.
-            src1_xyz = src1_dct.reshape(b, t, target_joints, coord_dim).reshape(-1, coord_dim)
-            src2_xyz = src2_dct.reshape(b, t, target_joints, coord_dim).reshape(-1, coord_dim)
-            rec1_xyz = rec1.reshape(-1, 3)
-            rec2_xyz = rec2.reshape(-1, 3)
-            loss_rec = torch.mean(torch.norm(rec1_xyz - src1_xyz, dim=-1)) + torch.mean(
-                torch.norm(rec2_xyz - src2_xyz, dim=-1)
-            )
+                rec1 = model.last_recon_h
+                rec2 = model.last_recon_r
+                # Reconstruction heads also operate in the DCT domain.
+                src1_xyz = src1_dct.reshape(b, t, target_joints, coord_dim).reshape(-1, coord_dim)
+                src2_xyz = src2_dct.reshape(b, t, target_joints, coord_dim).reshape(-1, coord_dim)
+                rec1_xyz = rec1.reshape(-1, 3)
+                rec2_xyz = rec2.reshape(-1, 3)
+                loss_rec = torch.mean(torch.norm(rec1_xyz - src1_xyz, dim=-1)) + torch.mean(
+                    torch.norm(rec2_xyz - src2_xyz, dim=-1)
+                )
 
-            kl_warmup = min(1.0, float(step + 1) / float(kl_warmup_steps))
-            loss_kl = masked_mean(model.last_kl_per_sample, intent_valid)
-            loss_intent_token = masked_mean(
-                model.last_intent_token_loss_per_sample,
-                intent_valid,
-            )
-            total = (
-                lambda_pre * loss_pre
-                + lambda_rec * loss_rec
-                + lambda_kl * kl_warmup * loss_kl
-                + lambda_intent_token * loss_intent_token
-            )
-            optimizer.zero_grad()
-            total.backward()
-            optimizer.step()
+                kl_warmup = min(1.0, float(step + 1) / float(kl_warmup_steps))
+                loss_kl = masked_mean(model.last_kl_per_sample, intent_valid)
+                loss_intent_token = masked_mean(
+                    model.last_intent_token_loss_per_sample,
+                    intent_valid,
+                )
+                total = (
+                    lambda_pre * loss_pre
+                    + lambda_rec * loss_rec
+                    + lambda_kl * kl_warmup * loss_kl
+                    + lambda_intent_token * loss_intent_token
+                )
+                optimizer.zero_grad()
+                total.backward()
+                optimizer.step()
 
-            step += 1
-            pbar.set_postfix(
-                {
-                    "loss": f"{total.item():.4f}",
-                    "p1": f"{loss_person1.item():.4f}",
-                    "p2": f"{loss_person2.item():.4f}",
-                    "rec": f"{loss_rec.item():.4f}",
-                    "kl": f"{loss_kl.item():.4f}",
-                    "intent": f"{loss_intent_token.item():.4f}",
-                    "intent_valid": f"{intent_valid.mean().item():.2f}",
-                }
-            )
+                step += 1
+                pbar.set_postfix(
+                    {
+                        "loss": f"{total.item():.4f}",
+                        "p1": f"{loss_person1.item():.4f}",
+                        "p2": f"{loss_person2.item():.4f}",
+                        "rec": f"{loss_rec.item():.4f}",
+                        "kl": f"{loss_kl.item():.4f}",
+                        "intent": f"{loss_intent_token.item():.4f}",
+                        "intent_valid": f"{intent_valid.mean().item():.2f}",
+                    }
+                )
+                if should_log(step, wandb_log_every):
+                    wandb_log(
+                        {
+                            "train/loss": total.item(),
+                            "train/loss_person1": loss_person1.item(),
+                            "train/loss_person2": loss_person2.item(),
+                            "train/loss_pre": loss_pre.item(),
+                            "train/loss_rec": loss_rec.item(),
+                            "train/loss_kl": loss_kl.item(),
+                            "train/loss_intent_token": loss_intent_token.item(),
+                            "train/kl_warmup": kl_warmup,
+                            "train/intent_valid_frac": intent_valid.mean().item(),
+                            "train/epoch": ep + 1,
+                            "train/lr": lr,
+                        },
+                        step=step,
+                    )
 
+                if args.max_steps > 0 and step >= args.max_steps:
+                    break
+
+            ckpt = Path(args.work_dir) / f"pretrain_stage1_epoch{ep+1}.pth"
+            torch.save(model.state_dict(), ckpt)
+            wandb_log({"checkpoint/epoch": ep + 1}, step=step)
             if args.max_steps > 0 and step >= args.max_steps:
                 break
 
-        ckpt = Path(args.work_dir) / f"pretrain_stage1_epoch{ep+1}.pth"
-        torch.save(model.state_dict(), ckpt)
-        if args.max_steps > 0 and step >= args.max_steps:
-            break
-
-    final_ckpt = Path(args.work_dir) / "pretrain_stage1_final.pth"
-    torch.save(model.state_dict(), final_ckpt)
-    print(f"saved: {final_ckpt}")
-    print(f"total steps: {step}")
+        final_ckpt = Path(args.work_dir) / "pretrain_stage1_final.pth"
+        torch.save(model.state_dict(), final_ckpt)
+        print(f"saved: {final_ckpt}")
+        print(f"total steps: {step}")
+    finally:
+        finish_wandb()
 
 
 if __name__ == "__main__":

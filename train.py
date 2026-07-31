@@ -9,6 +9,14 @@ from network.model import AINet as Model
 
 from utils.logger import get_logger, print_and_log_info
 from utils.pyt_utils import link_file, ensure_dir
+from utils.wandb_utils import (
+    add_wandb_args,
+    finish_wandb,
+    init_wandb,
+    resolve_wandb_settings,
+    should_log,
+    wandb_log,
+)
 from dataset.harper_3d_2 import Harper3D
 from test import test
 
@@ -63,8 +71,20 @@ parser.add_argument('--lambda-robot', type=float, default=None, help='robot futu
 parser.add_argument('--lambda-kl', type=float, default=None, help='intent KL loss weight')
 parser.add_argument('--lambda-intent-token', type=float, default=None, help='future interaction-token loss weight')
 parser.add_argument('--model-pth', type=str, default=None, help='Stage-1 checkpoint used for Stage-2 fine-tuning')
+add_wandb_args(parser)
 
 args = parser.parse_args()
+
+wandb_settings = resolve_wandb_settings(
+    config,
+    enable=args.wandb_enable,
+    project=args.wandb_project,
+    entity=args.wandb_entity,
+    run_name=args.wandb_run_name,
+    mode=args.wandb_mode,
+    log_every=args.wandb_log_every,
+)
+wandb_log_every = int(wandb_settings["log_every"])
 
 torch.use_deterministic_algorithms(True)
 ensure_dir('./result')
@@ -231,15 +251,26 @@ def train_step(harper_motion_input, harper_motion_target, model, optimizer, nb_i
     optimizer.step()
     optimizer, current_lr = update_lr_multistep(nb_iter, total_iter, max_lr, min_lr, optimizer)
     writer.add_scalar('LR/train', current_lr, nb_iter)
+    if should_log(nb_iter + 1, wandb_log_every):
+        wandb_log(
+            {
+                "train/loss": float(loss.detach().cpu()),
+                "train/loss_h": float(loss_h.detach().cpu()),
+                "train/loss_robot": float(loss_r.detach().cpu()),
+                "train/loss_rec": float(rec_loss.detach().cpu()),
+                "train/loss_kl": float(kl_loss.detach().cpu()),
+                "train/loss_intent_token": float(intent_token_loss.detach().cpu()),
+                "train/kl_warmup": kl_warmup,
+                "train/reg_loss": float(reg_loss.detach().cpu()),
+                "train/lr": current_lr,
+            },
+            step=nb_iter + 1,
+        )
 
     return loss.item(), optimizer, current_lr, loss_h, loss_r
 
-if __name__=="__main__":
-    model = Model(config)
-    model.set_stage(args.stage)
-    model.train()
-    model.cuda()
 
+def _run_training(model):
     # initialize optimizer
     semantic_modules = (
         model.interaction_encoder,
@@ -366,15 +397,52 @@ if __name__=="__main__":
                 # print(acc_tmp)
                 acc_log.write(''.join(str(nb_iter + 1) + '\n'))
                 line = ''
+                eval_metrics = {}
                 for key, value in res_dict.items():
                     line += str(key) + ',' + ','.join([str(a) for a in value]) + '\n'
+                    if hasattr(value, "__len__") and len(value) > 0:
+                        eval_metrics[f"eval/{key}"] = float(value[0]) if len(value) == 1 else float(sum(value) / len(value))
+                        for i, v in enumerate(value):
+                            eval_metrics[f"eval/{key}/t{i}"] = float(v)
                 acc_log.write(''.join(line))
+                if eval_metrics:
+                    wandb_log(eval_metrics, step=nb_iter + 1)
                 model.train()
 
             if (nb_iter + 1) == config.cos_lr_total_iters:
                 break
             nb_iter += 1
     acc_log.close()
-    writer.close()
     shutil.copyfile("./result/" + args.exp_name, os.path.join(args.work_dir, args.exp_name))
     shutil.copyfile("./result/" + args.exp_name, os.path.join(config.snapshot_dir, args.exp_name))
+
+
+if __name__=="__main__":
+    model = Model(config)
+    model.set_stage(args.stage)
+    model.train()
+    model.cuda()
+
+    init_wandb(
+        wandb_settings,
+        config={
+            "stage": args.stage,
+            "seed": args.seed,
+            "exp_name": args.exp_name,
+            "work_dir": args.work_dir,
+            "model_pth": args.model_pth or config.model_pth,
+            "lambda_pre": args.lambda_pre,
+            "lambda_rec": args.lambda_rec,
+            "lambda_robot": args.lambda_robot,
+            "lambda_kl": args.lambda_kl,
+            "lambda_intent_token": args.lambda_intent_token,
+            "harper_config": json.loads(json.dumps(config)),
+        },
+        job_type=f"stage{args.stage}",
+    )
+
+    try:
+        _run_training(model)
+    finally:
+        writer.close()
+        finish_wandb()

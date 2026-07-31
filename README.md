@@ -126,6 +126,15 @@ python pretrain.py --cfg config/h2h_pretrain_cfg.yml ^
   --work-dir ckpt_h2h_pretrain
 ```
 
+Enable Weights & Biases logging with `--wandb` (or set `wandb.enable: true` in the
+YAML). Optional flags: `--wandb-project`, `--wandb-entity`, `--wandb-run-name`,
+`--wandb-mode {online,offline,disabled}`, `--wandb-log-every`.
+
+```
+python pretrain.py --cfg config/h2h_pretrain_cfg.yml ^
+  --work-dir ckpt_h2h_pretrain --wandb --wandb-project human-intent
+```
+
 Stage-2 H-R fine-tuning with the new Stage-1 checkpoint:
 
 ```
@@ -133,5 +142,13 @@ python train.py --stage 2 ^
   --model-pth ckpt_h2h_pretrain/pretrain_stage1_final.pth ^
   --seed 888 --exp-name HARPER_result.txt ^
   --layer-norm-axis spatial --with-normalization
+```
+
+```
+python train.py --stage 2 ^
+  --model-pth ckpt_h2h_pretrain/pretrain_stage1_final.pth ^
+  --seed 888 --exp-name HARPER_result.txt ^
+  --layer-norm-axis spatial --with-normalization ^
+  --wandb --wandb-project human-intent
 ```
 where config files are located at `config/harper_config.yml`.
